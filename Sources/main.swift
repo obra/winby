@@ -4,6 +4,8 @@ import ScreenCaptureKit
 import Vision
 import KeyboardShortcuts
 import Sparkle
+import ServiceManagement
+import Carbon.HIToolbox
 
 // MARK: - Keyboard Shortcuts
 
@@ -20,8 +22,23 @@ class AppConfig: ObservableObject {
         didSet { UserDefaults.standard.set(debugMode, forKey: "debugMode") }
     }
 
+    @Published var launchAtLogin: Bool {
+        didSet {
+            do {
+                if launchAtLogin {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                debugLog("Failed to update launch at login: \(error)")
+            }
+        }
+    }
+
     init() {
         self.debugMode = UserDefaults.standard.bool(forKey: "debugMode")
+        self.launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
     @MainActor
@@ -30,6 +47,13 @@ class AppConfig: ObservableObject {
             return shortcut.description
         }
         return "Not set"
+    }
+
+    /// Check if the configured shortcut is Cmd+Tab
+    @MainActor
+    var isCmdTabShortcut: Bool {
+        guard let shortcut = KeyboardShortcuts.getShortcut(for: .toggleWinby) else { return false }
+        return shortcut.key == .tab && shortcut.modifiers == .command
     }
 }
 
@@ -76,6 +100,10 @@ func SLSConnectionGetPID(_ cid: Int32, _ pid: UnsafeMutablePointer<pid_t>) -> CG
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<UInt32>) -> AXError
 
+// Private API to enable/disable system hotkeys
+@_silgen_name("CGSSetGlobalHotKeyOperatingMode")
+func CGSSetGlobalHotKeyOperatingMode(_ connection: Int32, _ mode: Int32) -> CGError
+
 // MARK: - Async Semaphore
 
 actor AsyncSemaphore {
@@ -109,13 +137,18 @@ actor AsyncSemaphore {
 // MARK: - Window Info
 
 struct WindowInfo: Identifiable, Hashable {
-    let id: UInt32  // CGWindowID
+    let windowID: UInt32  // CGWindowID
     let pid: pid_t
     let appName: String
     let title: String
     let frame: CGRect
     let isOnScreen: Bool
     var duplicateIndex: Int = 0  // 0-based index for windows with same title in same app
+
+    // Unique ID for SwiftUI (handles tabs sharing same windowID)
+    var id: String {
+        "\(windowID)-\(pid)-\(title)-\(duplicateIndex)"
+    }
 
     var displayTitle: String {
         if title.isEmpty {
@@ -143,7 +176,6 @@ class WindowManager: ObservableObject {
 
     @Published var windows: [WindowInfo] = []
     @Published var selectedWindowID: UInt32? = nil
-    @Published var maximizedWindowID: UInt32? = nil
     @Published var sidebarResetTrigger: Bool = false  // Toggle to reset sidebar state
 
     private let cid: Int32
@@ -151,9 +183,6 @@ class WindowManager: ObservableObject {
 
     /// Cached thumbnails - kept even when windows go to background
     var thumbnailCache: [UInt32: NSImage] = [:]
-
-    /// Saved window positions for undo
-    var savedPositions: [UInt32: CGRect] = [:]
 
     /// Cached window content for search (windowID -> content snippet)
     var contentCache: [UInt32: String] = [:]
@@ -167,7 +196,9 @@ class WindowManager: ObservableObject {
     /// Content search results (windowID -> match score)
     @Published var contentMatches: [UInt32: Int] = [:]
 
-    let sidebarWidth: CGFloat = 250
+    /// Counter for generating synthetic window IDs for tabs without CGWindowID
+    private var syntheticIDCounter: UInt32 = UInt32.max - 1_000_000
+
 
     init() {
         cid = SLSMainConnectionID()
@@ -597,7 +628,7 @@ class WindowManager: ObservableObject {
     func debugContentFetch() {
         debugLog("=== Content fetch debug ===")
         for window in windows {
-            if let content = getWindowContent(windowID: window.id, pid: window.pid) {
+            if let content = getWindowContent(windowID: window.windowID, pid: window.pid) {
                 let preview = String(content.prefix(200)).replacingOccurrences(of: "\n", with: "\\n")
                 debugLog("[\(window.appName)] '\(window.title)': \(content.count) chars - '\(preview)...'")
             } else {
@@ -626,10 +657,10 @@ class WindowManager: ObservableObject {
         // 1. Have no content and haven't failed, OR
         // 2. Are on-screen and haven't been indexed recently (content may have changed)
         let windowsCopy = windows.filter { window in
-            if contentCache[window.id] == nil && !contentFailed.contains(window.id) {
+            if contentCache[window.windowID] == nil && !contentFailed.contains(window.windowID) {
                 return true  // Never indexed
             }
-            if window.isOnScreen, let lastTime = lastIndexed[window.id],
+            if window.isOnScreen, let lastTime = lastIndexed[window.windowID],
                now.timeIntervalSince(lastTime) > refreshInterval {
                 return true  // On-screen and stale
             }
@@ -656,10 +687,10 @@ class WindowManager: ObservableObject {
 
                         // Only try OCR on on-screen windows (can't capture off-screen)
                         if window.isOnScreen {
-                            if let content = await self.getWindowContentViaOCR(windowID: window.id), content.count > 20 {
+                            if let content = await self.getWindowContentViaOCR(windowID: window.windowID), content.count > 20 {
                                 await MainActor.run {
-                                    self.contentCache[window.id] = content
-                                    self.lastIndexed[window.id] = Date()
+                                    self.contentCache[window.windowID] = content
+                                    self.lastIndexed[window.windowID] = Date()
                                 }
                                 await semaphore.signal()
                                 return
@@ -667,15 +698,15 @@ class WindowManager: ObservableObject {
                         }
 
                         // Fall back to AX API (works for all windows)
-                        if let content = self.getWindowContent(windowID: window.id, pid: window.pid), content.count > 20 {
+                        if let content = self.getWindowContent(windowID: window.windowID, pid: window.pid), content.count > 20 {
                             await MainActor.run {
-                                self.contentCache[window.id] = content
-                                self.lastIndexed[window.id] = Date()
+                                self.contentCache[window.windowID] = content
+                                self.lastIndexed[window.windowID] = Date()
                             }
                         } else if !window.isOnScreen {
                             // Only mark as failed if off-screen (on-screen might succeed later)
                             _ = await MainActor.run {
-                                self.contentFailed.insert(window.id)
+                                self.contentFailed.insert(window.windowID)
                             }
                         }
 
@@ -704,7 +735,7 @@ class WindowManager: ObservableObject {
 
         // Search only cached content - instant
         for window in windows {
-            guard let content = contentCache[window.id] else { continue }
+            guard let content = contentCache[window.windowID] else { continue }
 
             let contentLower = content.lowercased()
             var totalScore = 0
@@ -720,7 +751,7 @@ class WindowManager: ObservableObject {
             }
 
             if allMatch && totalScore > 0 {
-                newMatches[window.id] = totalScore
+                newMatches[window.windowID] = totalScore
             }
         }
 
@@ -741,11 +772,16 @@ class WindowManager: ObservableObject {
     }
 
     func refresh() {
-        // Build a map of CGWindowID -> window info from CGWindowList
-        // This gives us frame info and isOnScreen status
-        var cgWindowInfo: [UInt32: (frame: CGRect, isOnScreen: Bool, title: String)] = [:]
+        // Reset synthetic ID counter for this refresh cycle
+        syntheticIDCounter = UInt32.max - 1_000_000
 
-        if let windowList = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+        // Build a map of CGWindowID -> window info from CGWindowList
+        // This gives us frame info, isOnScreen status, and z-order
+        var cgWindowInfo: [UInt32: (frame: CGRect, isOnScreen: Bool, title: String)] = [:]
+        var zOrder: [UInt32: Int] = [:]  // Lower = closer to front
+        var zIndex = 0
+
+        if let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
             for windowDict in windowList {
                 guard let windowID = windowDict[kCGWindowNumber as String] as? UInt32,
                       let boundsDict = windowDict[kCGWindowBounds as String] as? [String: CGFloat],
@@ -762,6 +798,8 @@ class WindowManager: ObservableObject {
                 let isOnScreen = windowDict[kCGWindowIsOnscreen as String] as? Bool ?? false
                 let title = windowDict[kCGWindowName as String] as? String ?? ""
                 cgWindowInfo[windowID] = (frame, isOnScreen, title)
+                zOrder[windowID] = zIndex
+                zIndex += 1
             }
         }
 
@@ -831,7 +869,7 @@ class WindowManager: ObservableObject {
 
                 // Add the main window
                 newWindows.append(WindowInfo(
-                    id: windowID,
+                    windowID: windowID,
                     pid: pid,
                     appName: appName,
                     title: title,
@@ -855,9 +893,17 @@ class WindowManager: ObservableObject {
                         }
                     }
 
-                    // Add tab entry (use parent window ID if we can't find specific one)
+                    // Add tab entry - generate synthetic ID if we can't find specific one
+                    let finalWindowID: UInt32
+                    if let found = tabWindowID {
+                        finalWindowID = found
+                    } else {
+                        // Generate unique synthetic ID for this tab
+                        syntheticIDCounter += 1
+                        finalWindowID = syntheticIDCounter
+                    }
                     newWindows.append(WindowInfo(
-                        id: tabWindowID ?? windowID,
+                        windowID: finalWindowID,
                         pid: pid,
                         appName: appName,
                         title: tabTitle,
@@ -866,6 +912,13 @@ class WindowManager: ObservableObject {
                     ))
                 }
             }
+        }
+
+        // Sort by z-order (front to back), windows not in z-order map go to end
+        newWindows.sort { a, b in
+            let aOrder = zOrder[a.windowID] ?? Int.max
+            let bOrder = zOrder[b.windowID] ?? Int.max
+            return aOrder < bOrder
         }
 
         // Compute duplicate indices for windows with same title in same app
@@ -912,7 +965,7 @@ class WindowManager: ObservableObject {
         }
 
         // Fallback: use app icon
-        if let window = windows.first(where: { $0.id == windowID }),
+        if let window = windows.first(where: { $0.windowID == windowID }),
            let app = NSRunningApplication(processIdentifier: window.pid),
            let icon = app.icon {
             return icon
@@ -922,20 +975,12 @@ class WindowManager: ObservableObject {
     }
 
     func bringToFront(_ windowID: UInt32) {
-        guard let window = windows.first(where: { $0.id == windowID }) else {
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
             debugLog("Window \(windowID) not found in list")
             return
         }
 
         debugLog("Trying to raise window \(windowID) '\(window.title)' from \(window.appName)")
-
-        // Restore any previously maximized window, then maximize this one
-        if let prevID = maximizedWindowID, prevID != windowID {
-            restoreWindow(prevID)
-        }
-        if maximizedWindowID != windowID {
-            maximizeWindow(windowID)
-        }
 
         // Use Accessibility API to raise the specific window
         let appElement = AXUIElementCreateApplication(window.pid)
@@ -972,15 +1017,19 @@ class WindowManager: ObservableObject {
                 let mainResult = AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, trueValue)
                 debugLog("Set main result: \(mainResult.rawValue)")
 
-                // 2. Try AXRaise action
+                // 2. Also set it as focused
+                let focusResult = AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, trueValue)
+                debugLog("Set focused result: \(focusResult.rawValue)")
+
+                // 3. Try AXRaise action
                 let raiseResult = AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
                 debugLog("Raise result: \(raiseResult.rawValue)")
 
-                // 3. Try AXPress action (works for some tab implementations)
+                // 4. Try AXPress action (works for some tab implementations)
                 let pressResult = AXUIElementPerformAction(axWindow, kAXPressAction as CFString)
                 debugLog("Press result: \(pressResult.rawValue)")
 
-                // 4. Bring app to front
+                // 5. Bring app to front and activate it
                 bringAppToFront(pid: window.pid)
                 return
             }
@@ -1146,114 +1195,20 @@ class WindowManager: ObservableObject {
     }
 
     private func bringAppToFront(pid: pid_t) {
-        let app = NSRunningApplication(processIdentifier: pid)
-        app?.activate()
-    }
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return }
 
-    /// Maximize a window to fill the screen (minus sidebar)
-    func maximizeWindow(_ windowID: UInt32) {
-        guard let window = windows.first(where: { $0.id == windowID }),
-              let screen = NSScreen.main else { return }
-
-        // Save current position/size before maximizing (only if it has a real frame)
-        if savedPositions[windowID] == nil && window.frame.width > 0 && window.frame.height > 0 {
-            savedPositions[windowID] = window.frame
-            debugLog("Saved original frame: \(window.frame)")
+        // Make sure the app is not hidden
+        if app.isHidden {
+            app.unhide()
         }
 
-        let screenFrame = screen.visibleFrame
+        // Activate the app
+        app.activate()
 
-        // Calculate target frame in Cocoa coordinates (origin at bottom-left)
-        // Window should be right of sidebar and fill the rest of visible area
-        let x = screenFrame.origin.x + sidebarWidth
-        let y = screenFrame.origin.y  // Bottom of visible frame
-        let width = screenFrame.width - sidebarWidth
-        let height = screenFrame.height
-
-        let targetFrame = CGRect(x: x, y: y, width: width, height: height)
-        debugLog("Maximizing window \(windowID) to frame: \(targetFrame) (screenFrame: \(screenFrame))")
-
-        // Use AX API for both position and size (more reliable than SkyLight for most apps)
-        resizeAndMoveWindow(windowID, pid: window.pid, to: targetFrame)
-
-        maximizedWindowID = windowID
-    }
-
-    /// Restore a maximized window to its original size/position
-    func restoreWindow(_ windowID: UInt32? = nil) {
-        let targetID = windowID ?? maximizedWindowID
-        guard let id = targetID,
-              let originalFrame = savedPositions[id],
-              let window = windows.first(where: { $0.id == id }) else { return }
-
-        guard let screen = NSScreen.main else { return }
-
-        // savedPositions stores CG coordinates (origin at top-left)
-        // AX API uses Cocoa coordinates (origin at bottom-left)
-        // Convert: cocoaY = screenHeight - cgY - windowHeight
-        let screenHeight = screen.frame.height
-        let cocoaY = screenHeight - originalFrame.origin.y - originalFrame.height
-        let cocoaFrame = CGRect(
-            x: originalFrame.origin.x,
-            y: cocoaY,
-            width: originalFrame.width,
-            height: originalFrame.height
-        )
-
-        debugLog("Restoring window \(id) from CG \(originalFrame) to Cocoa \(cocoaFrame)")
-        resizeAndMoveWindow(id, pid: window.pid, to: cocoaFrame)
-
-        savedPositions.removeValue(forKey: id)
-        if maximizedWindowID == id {
-            maximizedWindowID = nil
-        }
-    }
-
-    /// Toggle maximize/restore for a window
-    func toggleMaximize(_ windowID: UInt32) {
-        if maximizedWindowID == windowID {
-            restoreWindow(windowID)
-        } else {
-            // Restore previous maximized window first
-            if let prev = maximizedWindowID {
-                restoreWindow(prev)
-            }
-            maximizeWindow(windowID)
-        }
-    }
-
-    private func resizeAndMoveWindow(_ windowID: UInt32, pid: pid_t, to frame: CGRect) {
+        // Also set it as the frontmost application via AX
         let appElement = AXUIElementCreateApplication(pid)
-
-        var windowsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let axWindows = windowsRef as? [AXUIElement] else {
-            debugLog("resizeAndMoveWindow: couldn't get AX windows for pid \(pid)")
-            return
-        }
-
-        for axWindow in axWindows {
-            var axWindowID: UInt32 = 0
-            if _AXUIElementGetWindow(axWindow, &axWindowID) == .success && axWindowID == windowID {
-                debugLog("Found AX window \(axWindowID), setting frame to \(frame)")
-
-                // AX uses Cocoa coordinates (origin at bottom-left of main screen)
-                // frame parameter is in Cocoa coordinates
-                var position = frame.origin
-                if let posRef = AXValueCreate(.cgPoint, &position) {
-                    let posResult = AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, posRef)
-                    debugLog("Position set result: \(posResult.rawValue)")
-                }
-
-                var size = frame.size
-                if let sizeRef = AXValueCreate(.cgSize, &size) {
-                    let sizeResult = AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeRef)
-                    debugLog("Size set result: \(sizeResult.rawValue)")
-                }
-                return
-            }
-        }
-        debugLog("resizeAndMoveWindow: window \(windowID) not found in AX windows")
+        let trueValue: CFTypeRef = kCFBooleanTrue
+        AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, trueValue)
     }
 
     func moveWindow(_ windowID: UInt32, to point: CGPoint) {
@@ -1267,11 +1222,9 @@ class WindowManager: ObservableObject {
 struct WindowRow: View {
     let window: WindowInfo
     let isSelected: Bool
-    let isMaximized: Bool
     let hasContentMatch: Bool
     let thumbnail: NSImage?
     let onSelect: () -> Void
-    let onMaximize: () -> Void
 
     var body: some View {
         Button(action: onSelect) {
@@ -1311,32 +1264,17 @@ struct WindowRow: View {
                 }
 
                 Spacer()
-
-                // Maximized indicator
-                if isMaximized {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 10))
-                        .foregroundColor(.accentColor)
-                }
             }
         }
         .buttonStyle(.plain)
         .padding(.vertical, 4)
         .padding(.horizontal, 8)
-        .background(
-            isSelected ? Color.accentColor.opacity(0.3) :
-            isMaximized ? Color.accentColor.opacity(0.1) : Color.clear
-        )
+        .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
         .cornerRadius(6)
         .overlay(
             RoundedRectangle(cornerRadius: 6)
                 .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 2)
         )
-        .contextMenu {
-            Button(isMaximized ? "Restore Size" : "Maximize") {
-                onMaximize()
-            }
-        }
     }
 }
 
@@ -1349,15 +1287,17 @@ struct SettingsView: View {
         Form {
             Section("Activation Shortcut") {
                 KeyboardShortcuts.Recorder("Show Winby:", name: .toggleWinby)
+                    .help("Press Cmd+Tab here to use it as your shortcut")
             }
 
             Section("General") {
+                Toggle("Launch at Login", isOn: $config.launchAtLogin)
                 Toggle("Debug Mode", isOn: $config.debugMode)
                     .help("Show debug controls and log to /tmp/wm_debug.log")
             }
         }
         .formStyle(.grouped)
-        .frame(width: 350, height: 200)
+        .frame(width: 350, height: 250)
         .padding()
     }
 }
@@ -1382,7 +1322,7 @@ struct SidebarView: View {
         let scored = manager.windows.compactMap { window -> (WindowInfo, Int)? in
             let titleScore = fuzzyMatch(query: query, in: window.displayTitle.lowercased())
             let appScore = fuzzyMatch(query: query, in: window.appName.lowercased())
-            let contentScore = manager.contentMatches[window.id] ?? 0
+            let contentScore = manager.contentMatches[window.windowID] ?? 0
 
             // Window matches if title/app matches OR content matches
             let titleAppScore = max(titleScore, appScore)
@@ -1454,12 +1394,7 @@ struct SidebarView: View {
 
     /// Flat list of windows for keyboard navigation (matches visual order)
     var flatWindowList: [WindowInfo] {
-        groupedWindows.flatMap { $0.1 }
-    }
-
-    var groupedWindows: [(String, [WindowInfo])] {
-        let grouped = Dictionary(grouping: filteredWindows, by: { $0.appName })
-        return grouped.sorted { $0.key < $1.key }
+        filteredWindows
     }
 
     func selectNext() {
@@ -1467,11 +1402,11 @@ struct SidebarView: View {
         guard !list.isEmpty else { return }
 
         if let current = manager.selectedWindowID,
-           let idx = list.firstIndex(where: { $0.id == current }) {
+           let idx = list.firstIndex(where: { $0.windowID == current }) {
             let nextIdx = min(idx + 1, list.count - 1)
-            manager.selectedWindowID = list[nextIdx].id
+            manager.selectedWindowID = list[nextIdx].windowID
         } else {
-            manager.selectedWindowID = list[0].id
+            manager.selectedWindowID = list[0].windowID
         }
     }
 
@@ -1480,11 +1415,11 @@ struct SidebarView: View {
         guard !list.isEmpty else { return }
 
         if let current = manager.selectedWindowID,
-           let idx = list.firstIndex(where: { $0.id == current }) {
+           let idx = list.firstIndex(where: { $0.windowID == current }) {
             let prevIdx = max(idx - 1, 0)
-            manager.selectedWindowID = list[prevIdx].id
+            manager.selectedWindowID = list[prevIdx].windowID
         } else {
-            manager.selectedWindowID = list[0].id
+            manager.selectedWindowID = list[0].windowID
         }
     }
 
@@ -1502,7 +1437,7 @@ struct SidebarView: View {
     /// Update debug content when selection changes
     func updateDebugContent() {
         guard showDebugPanel, let windowID = manager.selectedWindowID,
-              let window = manager.windows.first(where: { $0.id == windowID }) else {
+              let window = manager.windows.first(where: { $0.windowID == windowID }) else {
             debugContent = "No window selected"
             return
         }
@@ -1588,49 +1523,35 @@ struct SidebarView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(groupedWindows, id: \.0) { appName, windows in
-                            Section {
-                                ForEach(windows) { window in
-                                    WindowRow(
-                                        window: window,
-                                        isSelected: manager.selectedWindowID == window.id,
-                                        isMaximized: manager.maximizedWindowID == window.id,
-                                        hasContentMatch: manager.contentMatches[window.id] != nil,
-                                        thumbnail: thumbnails[window.id],
-                                        onSelect: {
-                                            manager.selectedWindowID = window.id
-                                            manager.bringToFront(window.id)
-                                            searchText = ""
-                                            // Hide sidebar after selecting a window
-                                            if let appDelegate = NSApp.delegate as? AppDelegate {
-                                                appDelegate.hideSidebar()
-                                            }
-                                        },
-                                        onMaximize: {
-                                            manager.toggleMaximize(window.id)
-                                        }
-                                    )
-                                    .id(window.id)
+                        ForEach(filteredWindows) { window in
+                            WindowRow(
+                                window: window,
+                                isSelected: manager.selectedWindowID == window.windowID,
+                                hasContentMatch: manager.contentMatches[window.windowID] != nil,
+                                thumbnail: thumbnails[window.windowID],
+                                onSelect: {
+                                    manager.selectedWindowID = window.windowID
+                                    manager.bringToFront(window.windowID)
+                                    searchText = ""
+                                    // Hide sidebar after selecting a window
+                                    if let appDelegate = NSApp.delegate as? AppDelegate {
+                                        appDelegate.hideSidebar()
+                                    }
                                 }
-                            } header: {
-                                Text(appName)
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundColor(.secondary)
-                                    .padding(.horizontal, 8)
-                                    .padding(.top, 8)
-                            }
+                            )
+                            .id(window.id)  // Use String id for SwiftUI identity
                         }
                     }
                     .padding(.vertical, 4)
                     .padding(.bottom, 50)  // Extra space so last item can scroll into view
                 }
                 .onChange(of: manager.selectedWindowID) { _, newValue in
-                    if let id = newValue {
+                    if let windowID = newValue,
+                       let window = flatWindowList.first(where: { $0.windowID == windowID }) {
                         // Use bottom anchor when near end of list for better visibility
-                        let list = flatWindowList
-                        let isNearEnd = list.last?.id == id
+                        let isNearEnd = flatWindowList.last?.windowID == windowID
                         withAnimation {
-                            proxy.scrollTo(id, anchor: isNearEnd ? .bottom : .center)
+                            proxy.scrollTo(window.id, anchor: isNearEnd ? .bottom : .center)
                         }
                     }
                 }
@@ -1644,13 +1565,6 @@ struct SidebarView: View {
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
                 Spacer()
-                if manager.maximizedWindowID != nil {
-                    Button("Restore") {
-                        manager.restoreWindow()
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 10))
-                }
             }
                 .padding(8)
             }
@@ -1736,12 +1650,12 @@ struct SidebarView: View {
             // Start with existing thumbnails to preserve cached ones
             var newThumbnails = thumbnails
             for window in manager.windows {
-                if let thumb = await manager.thumbnail(for: window.id) {
-                    newThumbnails[window.id] = thumb
+                if let thumb = await manager.thumbnail(for: window.windowID) {
+                    newThumbnails[window.windowID] = thumb
                 }
             }
             // Remove thumbnails for windows that no longer exist
-            let currentIDs = Set(manager.windows.map { $0.id })
+            let currentIDs = Set(manager.windows.map { $0.windowID })
             newThumbnails = newThumbnails.filter { currentIDs.contains($0.key) }
 
             await MainActor.run {
@@ -1753,10 +1667,24 @@ struct SidebarView: View {
 
 // MARK: - App Delegate
 
+// Global reference for CGEventTap callback
+private var globalAppDelegate: AppDelegate?
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem?
     let updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+
+    // Event tap for Cmd+Tab interception
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+
+    // Carbon hotkey for Cmd+Tab (bypasses system handler)
+    private var carbonHotKeyRef: EventHotKeyRef?
+    private var carbonEventHandler: EventHandlerRef?
+
+    // Track if we're in tab-cycling mode (second+ Tab press while Cmd held)
+    var isTabCycling = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Setup global hotkey (Cmd+Shift+Space to focus switcher)
@@ -1835,7 +1763,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        panel.makeKeyAndOrderFront(nil)
+        // Start hidden - user activates with hotkey
+        panel.orderOut(nil)
 
         // Auto-hide when window loses focus
         NotificationCenter.default.addObserver(
@@ -1936,6 +1865,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let screen = NSScreen.main else { return }
         let screenFrame = screen.visibleFrame
 
+        // Disable system hotkeys (like Cmd+Tab) while our switcher is active
+        _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 1)  // 1 = disable
+
         // Start off-screen to the left
         window.setFrame(
             NSRect(
@@ -1971,6 +1903,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let screen = NSScreen.main else { return }
         let screenFrame = screen.visibleFrame
 
+        // Clear cycling state
+        isTabCycling = false
+
+        // Re-enable system hotkeys
+        _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 0)  // 0 = enable
+
         // Reset sidebar state
         WindowManager.shared.sidebarResetTrigger.toggle()
 
@@ -1996,10 +1934,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         WindowManager.shared.refresh()
     }
 
-    @objc func restoreMaximized() {
-        WindowManager.shared.restoreWindow()
-    }
-
     func requestAccessibilityPermissions() {
         let options = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as String: true]
         let trusted = AXIsProcessTrustedWithOptions(options as CFDictionary)
@@ -2008,11 +1942,292 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func setupGlobalHotkey() {
-        // Use KeyboardShortcuts library for global hotkey
-        KeyboardShortcuts.onKeyDown(for: .toggleWinby) { [weak self] in
-            self?.toggleSidebar()
+    /// Register Cmd+Tab as a Carbon hotkey (bypasses system Dock handler)
+    func setupCarbonHotkey() {
+        // Only register if Cmd+Tab is the configured shortcut
+        // Called from main thread, use assumeIsolated
+        let isCmdTab = MainActor.assumeIsolated { AppConfig.shared.isCmdTabShortcut }
+        guard isCmdTab else {
+            debugLog("Cmd+Tab not configured, skipping Carbon hotkey")
+            return
         }
+
+        // Unregister existing hotkey if any
+        if let existingRef = carbonHotKeyRef {
+            UnregisterEventHotKey(existingRef)
+            carbonHotKeyRef = nil
+        }
+
+        // Define the hotkey: Cmd+Tab
+        var hotKeyID = EventHotKeyID()
+        hotKeyID.signature = OSType(0x57494E42)  // "WINB"
+        hotKeyID.id = 1
+
+        // Tab = 48, Cmd = cmdKey
+        let keyCode: UInt32 = 48
+        let modifiers: UInt32 = UInt32(cmdKey)
+
+        // Register the hotkey
+        var hotKeyRef: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            keyCode,
+            modifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+
+        if status == noErr, let ref = hotKeyRef {
+            carbonHotKeyRef = ref
+            debugLog("Carbon Cmd+Tab hotkey registered successfully")
+
+            // Install event handler for the hotkey
+            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+
+            let handlerCallback: EventHandlerUPP = { (_, event, userData) -> OSStatus in
+                guard let appDelegate = globalAppDelegate else { return noErr }
+
+                DispatchQueue.main.async {
+                    // Check if settings window is focused - don't handle if so
+                    if appDelegate.settingsWindow?.isKeyWindow == true {
+                        return
+                    }
+
+                    if appDelegate.window.isVisible {
+                        // Second+ press: enter cycling mode
+                        appDelegate.isTabCycling = true
+                        appDelegate.selectNextWindow()
+                    } else {
+                        // First press: show sidebar, do NOT enter cycling mode
+                        appDelegate.showSidebar()
+                        appDelegate.selectNextWindow()
+                    }
+                }
+                return noErr
+            }
+
+            var handlerRef: EventHandlerRef?
+            InstallEventHandler(
+                GetApplicationEventTarget(),
+                handlerCallback,
+                1,
+                &eventType,
+                nil,
+                &handlerRef
+            )
+            carbonEventHandler = handlerRef
+        } else {
+            debugLog("Failed to register Carbon hotkey: \(status)")
+        }
+    }
+
+    func setupGlobalHotkey() {
+        // 1. Set up customizable hotkey via KeyboardShortcuts
+        KeyboardShortcuts.onKeyDown(for: .toggleWinby) { [weak self] in
+            guard let self = self else { return }
+
+            // KeyboardShortcuts callbacks run on main thread
+            MainActor.assumeIsolated {
+                // If Cmd+Tab is the configured shortcut, Carbon hotkey handles it instead
+                if AppConfig.shared.isCmdTabShortcut {
+                    return
+                }
+
+                // Check if shift is held for reverse direction
+                let goBackward = NSEvent.modifierFlags.contains(.shift)
+
+                if self.window.isVisible {
+                    // Second+ press: enter cycling mode
+                    self.isTabCycling = true
+                    if goBackward {
+                        self.selectPreviousWindow()
+                    } else {
+                        self.selectNextWindow()
+                    }
+                } else {
+                    // First press: show sidebar, do NOT enter cycling mode
+                    self.showSidebar()
+                    if goBackward {
+                        self.selectPreviousWindow()
+                    } else {
+                        self.selectNextWindow()
+                    }
+                }
+            }
+        }
+
+        // 2. Register Carbon hotkey for Cmd+Tab (this takes priority over the system)
+        setupCarbonHotkey()
+
+        // 3. Set up CGEventTap to handle Cmd release and Cmd+Shift+Tab
+        globalAppDelegate = self
+
+        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                return globalAppDelegate?.handleEventTap(proxy: proxy, type: type, event: event) ?? Unmanaged.passRetained(event)
+            },
+            userInfo: nil
+        ) else {
+            debugLog("Failed to create event tap for Cmd+Tab - accessibility permissions may be needed")
+            return
+        }
+
+        eventTap = tap
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+
+        if let source = runLoopSource {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            debugLog("CGEventTap installed successfully for Cmd+Tab")
+        }
+    }
+
+    func handleEventTap(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        // Check if Cmd+Tab is configured as the shortcut
+        // Event tap callback runs on main thread, so use assumeIsolated to avoid deadlock
+        let (shouldInterceptCmdTab, settingsIsKey): (Bool, Bool)
+        if Thread.isMainThread {
+            (shouldInterceptCmdTab, settingsIsKey) = MainActor.assumeIsolated {
+                (AppConfig.shared.isCmdTabShortcut, self.settingsWindow?.isKeyWindow ?? false)
+            }
+        } else {
+            (shouldInterceptCmdTab, settingsIsKey) = DispatchQueue.main.sync {
+                MainActor.assumeIsolated {
+                    (AppConfig.shared.isCmdTabShortcut, self.settingsWindow?.isKeyWindow ?? false)
+                }
+            }
+        }
+
+        // If settings window is focused, intercept Cmd+Tab but post synthetic event for recorder
+        if settingsIsKey && type == .keyDown {
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            let flags = event.flags
+            let isTab = keyCode == 48
+            let isCmd = flags.contains(.maskCommand)
+
+            if isTab && isCmd {
+                // Post synthetic key event to the app so recorder can capture it
+                DispatchQueue.main.async {
+                    if let syntheticEvent = NSEvent.keyEvent(
+                        with: .keyDown,
+                        location: .zero,
+                        modifierFlags: [.command],
+                        timestamp: ProcessInfo.processInfo.systemUptime,
+                        windowNumber: 0,
+                        context: nil,
+                        characters: "\t",
+                        charactersIgnoringModifiers: "\t",
+                        isARepeat: false,
+                        keyCode: 48
+                    ) {
+                        NSApp.sendEvent(syntheticEvent)
+                    }
+                }
+                // Block system Cmd+Tab
+                return nil
+            }
+        }
+
+        // Handle modifier key changes (detect when Cmd is released)
+        if type == .flagsChanged {
+            let flags = event.flags
+
+            // If Cmd is released while in cycling mode (second+ Tab was pressed), activate
+            if isTabCycling && !flags.contains(.maskCommand) {
+                DispatchQueue.main.async { [weak self] in
+                    self?.activateSelectedAndHide()
+                }
+            }
+            // If Cmd is released after just one Tab (not cycling), window stays open
+            return Unmanaged.passRetained(event)
+        }
+
+        // Handle key down events
+        if type == .keyDown {
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            let flags = event.flags
+
+            // Tab key = 48
+            let isTab = keyCode == 48
+            let isCmd = flags.contains(.maskCommand)
+            let isShift = flags.contains(.maskShift)
+            let hasOtherModifiers = flags.contains(.maskAlternate) || flags.contains(.maskControl)
+
+            // Only intercept Cmd+Tab (or Cmd+Shift+Tab) if it's the configured shortcut
+            // and no other modifiers are pressed
+            if isTab && isCmd && !hasOtherModifiers && shouldInterceptCmdTab {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+
+                    if !self.window.isVisible {
+                        // First shortcut press: show sidebar, select first window
+                        // Do NOT enter cycling mode yet - release will keep window open
+                        self.showSidebar()
+                        self.selectNextWindow()
+                    } else {
+                        // Second+ shortcut press while visible: NOW enter cycling mode
+                        self.isTabCycling = true
+                        if isShift {
+                            self.selectPreviousWindow()
+                        } else {
+                            self.selectNextWindow()
+                        }
+                    }
+                }
+                // Consume the event (don't pass to system)
+                return nil
+            }
+        }
+
+        // Pass other events through
+        return Unmanaged.passRetained(event)
+    }
+
+    func selectNextWindow() {
+        let manager = WindowManager.shared
+        let windows = manager.windows
+
+        guard !windows.isEmpty else { return }
+
+        if let current = manager.selectedWindowID,
+           let idx = windows.firstIndex(where: { $0.windowID == current }) {
+            let nextIdx = (idx + 1) % windows.count
+            manager.selectedWindowID = windows[nextIdx].windowID
+        } else {
+            // Select first window
+            manager.selectedWindowID = windows[0].windowID
+        }
+    }
+
+    func selectPreviousWindow() {
+        let manager = WindowManager.shared
+        let windows = manager.windows
+
+        guard !windows.isEmpty else { return }
+
+        if let current = manager.selectedWindowID,
+           let idx = windows.firstIndex(where: { $0.windowID == current }) {
+            let prevIdx = idx > 0 ? idx - 1 : windows.count - 1
+            manager.selectedWindowID = windows[prevIdx].windowID
+        } else {
+            // Select last window
+            manager.selectedWindowID = windows[windows.count - 1].windowID
+        }
+    }
+
+    func activateSelectedAndHide() {
+        let manager = WindowManager.shared
+        if let windowID = manager.selectedWindowID {
+            manager.bringToFront(windowID)
+        }
+        hideSidebar()
     }
 }
 
