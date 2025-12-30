@@ -150,6 +150,12 @@ struct WindowInfo: Identifiable, Hashable {
         "\(windowID)-\(pid)-\(title)-\(duplicateIndex)"
     }
 
+    /// Get the app icon from the running application
+    var appIcon: NSImage? {
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return nil }
+        return app.icon
+    }
+
     var displayTitle: String {
         if title.isEmpty {
             return appName
@@ -1209,6 +1215,25 @@ class WindowManager: ObservableObject {
         let appElement = AXUIElementCreateApplication(pid)
         let trueValue: CFTypeRef = kCFBooleanTrue
         AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, trueValue)
+
+        // After a brief delay, ensure the focused window actually has keyboard focus
+        // This is needed for apps with tabs where selecting a tab doesn't auto-focus content
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // Get the app's focused window and set focus on it again
+            var focusedWindow: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+               let axWindow = focusedWindow {
+                // Raise the window
+                AXUIElementPerformAction(axWindow as! AXUIElement, kAXRaiseAction as CFString)
+
+                // Set it as main and focused
+                AXUIElementSetAttributeValue(axWindow as! AXUIElement, kAXMainAttribute as CFString, trueValue)
+                AXUIElementSetAttributeValue(axWindow as! AXUIElement, kAXFocusedAttribute as CFString, trueValue)
+            }
+
+            // Re-activate to ensure keyboard focus
+            app.activate()
+        }
     }
 
     func moveWindow(_ windowID: UInt32, to point: CGPoint) {
@@ -1229,19 +1254,31 @@ struct WindowRow: View {
     var body: some View {
         Button(action: onSelect) {
             HStack(spacing: 8) {
-                // Thumbnail
-                if let thumbnail = thumbnail {
-                    Image(nsImage: thumbnail)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 60, height: 45)
-                        .cornerRadius(4)
-                        .shadow(radius: 1)
-                } else {
-                    Rectangle()
-                        .fill(Color.gray.opacity(0.3))
-                        .frame(width: 60, height: 45)
-                        .cornerRadius(4)
+                // Thumbnail with app icon badge
+                ZStack(alignment: .bottomTrailing) {
+                    if let thumbnail = thumbnail {
+                        Image(nsImage: thumbnail)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 60, height: 45)
+                            .cornerRadius(4)
+                            .shadow(radius: 1)
+                    } else {
+                        Rectangle()
+                            .fill(Color.gray.opacity(0.3))
+                            .frame(width: 60, height: 45)
+                            .cornerRadius(4)
+                    }
+
+                    // App icon badge
+                    if let icon = window.appIcon {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 20, height: 20)
+                            .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 1)
+                            .offset(x: 4, y: 4)
+                    }
                 }
 
                 // Info
