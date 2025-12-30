@@ -225,8 +225,9 @@ class WindowManager: ObservableObject {
     var tabOcrCache: [String: String] = [:]
 
     /// Helper to generate tab cache key
-    private func tabCacheKey(pid: pid_t, title: String) -> String {
-        return "\(pid):\(title)"
+    /// Includes tabIndex to differentiate tabs with identical titles
+    private func tabCacheKey(pid: pid_t, title: String, tabIndex: Int) -> String {
+        return "\(pid):\(title):\(tabIndex)"
     }
 
     /// Cached window content for search (windowID -> content snippet)
@@ -325,6 +326,7 @@ class WindowManager: ObservableObject {
 
                 // Found a tab group - get its tabs
                 if role == "AXTabGroup" {
+                    // First try kAXTabsAttribute (standard tabs)
                     var tabsRef: CFTypeRef?
                     if AXUIElementCopyAttributeValue(element, kAXTabsAttribute as CFString, &tabsRef) == .success,
                        let tabElements = tabsRef as? [AXUIElement] {
@@ -339,6 +341,32 @@ class WindowManager: ObservableObject {
                                 if AXUIElementCopyAttributeValue(tab, kAXValueAttribute as CFString, &valueRef) == .success,
                                    let value = valueRef as? Int, value == 1 {
                                     selectedIndex = index
+                                }
+                            }
+                        }
+                    }
+                    // If no tabs found, check for radio buttons (Terminal.app uses this)
+                    if tabs.isEmpty {
+                        var childrenRef: CFTypeRef?
+                        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+                           let children = childrenRef as? [AXUIElement] {
+                            for (index, child) in children.enumerated() {
+                                var childRoleRef: CFTypeRef?
+                                if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &childRoleRef) == .success,
+                                   let childRole = childRoleRef as? String,
+                                   childRole == "AXRadioButton" {
+                                    var titleRef: CFTypeRef?
+                                    if AXUIElementCopyAttributeValue(child, kAXTitleAttribute as CFString, &titleRef) == .success,
+                                       let title = titleRef as? String, !title.isEmpty {
+                                        tabs.append(title)
+
+                                        // Check if selected
+                                        var valueRef: CFTypeRef?
+                                        if AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &valueRef) == .success,
+                                           let value = valueRef as? Int, value == 1 {
+                                            selectedIndex = index
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -721,7 +749,7 @@ class WindowManager: ObservableObject {
             return nil
         }
 
-        let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+        let cacheKey = tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
 
         // For background tabs, check tabOcrCache first
         if window.parentWindowID != nil {
@@ -1205,7 +1233,7 @@ class WindowManager: ObservableObject {
 
         // For background tabs, check tab screenshot cache first
         if window.parentWindowID != nil {
-            let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+            let cacheKey = tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
             if let cached = tabScreenshotCache[cacheKey] {
                 return cached
             }
@@ -1234,7 +1262,7 @@ class WindowManager: ObservableObject {
                 thumbnailCache[windowID] = nsImage
 
                 // Cache full resolution version for background tab use
-                let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+                let cacheKey = tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
                 let fullResConfig = SCStreamConfiguration()
                 fullResConfig.width = Int(scWindow.frame.width * 2)  // Retina
                 fullResConfig.height = Int(scWindow.frame.height * 2)
@@ -1276,10 +1304,94 @@ class WindowManager: ObservableObject {
         bringAppToFront(pid: window.pid)
     }
 
+    /// Direct AX-based tab switching - clicks tab radio buttons directly via Accessibility API
+    /// Returns true if successful
+    private func selectTabViaAX(pid: pid_t, tabIndex: Int) -> Bool {
+        let appElement = AXUIElementCreateApplication(pid)
+
+        // Get windows
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement],
+              let window = axWindows.first else {
+            print("[Winby] AX tab switch: no windows found")
+            return false
+        }
+
+        // Find tab group recursively
+        func findTabGroup(in element: AXUIElement, depth: Int = 0) -> AXUIElement? {
+            guard depth < 6 else { return nil }
+
+            var roleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+               let role = roleRef as? String, role == "AXTabGroup" {
+                return element
+            }
+
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                for child in children {
+                    if let found = findTabGroup(in: child, depth: depth + 1) {
+                        return found
+                    }
+                }
+            }
+            return nil
+        }
+
+        guard let tabGroup = findTabGroup(in: window) else {
+            print("[Winby] AX tab switch: no tab group found")
+            return false
+        }
+
+        // Get children (radio buttons) of tab group
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(tabGroup, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else {
+            print("[Winby] AX tab switch: no children in tab group")
+            return false
+        }
+
+        // Filter to radio buttons only
+        var radioButtons: [AXUIElement] = []
+        for child in children {
+            var roleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleRef) == .success,
+               let role = roleRef as? String, role == "AXRadioButton" {
+                radioButtons.append(child)
+            }
+        }
+
+        guard tabIndex < radioButtons.count else {
+            print("[Winby] AX tab switch: index \(tabIndex) out of range (have \(radioButtons.count) tabs)")
+            return false
+        }
+
+        let targetTab = radioButtons[tabIndex]
+
+        // Get title for logging
+        var titleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(targetTab, kAXTitleAttribute as CFString, &titleRef)
+        let title = titleRef as? String ?? "unknown"
+
+        // Click it
+        let result = AXUIElementPerformAction(targetTab, kAXPressAction as CFString)
+        print("[Winby] AX tab switch: clicked tab \(tabIndex) '\(title)' - result: \(result.rawValue)")
+        return result == .success
+    }
+
     /// Try to select a tab using AppleScript (more reliable for Terminal, Safari, etc.)
     /// Returns true if AppleScript worked, false if we need to fall back to AX
     private func selectTabViaAppleScript(appName: String, pid: pid_t, tabTitle: String, tabIndex: Int) -> Bool {
         let bundleId = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+
+        // For Terminal.app, use direct AX approach (AppleScript doesn't work reliably from Swift)
+        if bundleId == "com.apple.Terminal" {
+            print("[Winby] Terminal detected, using direct AX tab switch")
+            return selectTabViaAX(pid: pid, tabIndex: tabIndex)
+        }
+
         let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
                                    .replacingOccurrences(of: "\"", with: "\\\"")
         let targetIndex = tabIndex + 1  // AppleScript is 1-indexed
@@ -1342,38 +1454,24 @@ class WindowManager: ObservableObject {
             script = """
             tell application "System Events"
                 tell process "\(escapedAppName)"
-                    try
-                        set tabButtons to every radio button of tab group 1 of window 1
-                        set tabCount to count of tabButtons
+                    tell window 1
+                        try
+                            set tg to tab group 1
+                            set tabButtons to every radio button of tg
+                            set tabCount to count of tabButtons
 
-                        -- First try by index (handles duplicate titles)
-                        if \(targetIndex) ≤ tabCount then
-                            set t to item \(targetIndex) of tabButtons
-                            set tabName to title of t
-                            if tabName contains "\(escapedTitle)" then
+                            -- Click by index directly (handles duplicate titles)
+                            if \(targetIndex) ≤ tabCount then
+                                set t to radio button \(targetIndex) of tg
                                 click t
-                                return "clicked by index " & \(targetIndex) & ": " & tabName
+                                return "clicked by index " & \(targetIndex) & ": " & (title of t)
                             end if
-                        end if
 
-                        -- Fall back to title matching
-                        repeat with t in tabButtons
-                            set tabName to title of t
-                            if tabName contains "\(escapedTitle)" then
-                                click t
-                                return "clicked by title: " & tabName
-                            end if
-                        end repeat
-
-                        -- Debug: list available tabs
-                        set availableTabs to {}
-                        repeat with t in tabButtons
-                            set end of availableTabs to title of t
-                        end repeat
-                        return "not found in " & tabCount & " tabs: " & (availableTabs as text)
-                    on error errMsg
-                        return "error: " & errMsg
-                    end try
+                            return "index \(targetIndex) out of range, only " & tabCount & " tabs"
+                        on error errMsg
+                            return "error: " & errMsg
+                        end try
+                    end tell
                 end tell
             end tell
             """
@@ -1554,7 +1652,7 @@ class WindowManager: ObservableObject {
         }
 
         // Then activate the app (this updates the menu bar)
-        app.activate(options: [.activateIgnoringOtherApps])
+        app.activate()
 
         // For setting AX attributes
         let trueValue: CFTypeRef = kCFBooleanTrue
@@ -1727,7 +1825,7 @@ class WindowManager: ObservableObject {
             }
             // Activate the app to update menu bar
             if let app = NSRunningApplication(processIdentifier: window.pid) {
-                app.activate(options: [.activateIgnoringOtherApps])
+                app.activate()
             }
         }
     }
