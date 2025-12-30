@@ -137,13 +137,15 @@ actor AsyncSemaphore {
 // MARK: - Window Info
 
 struct WindowInfo: Identifiable, Hashable {
-    let windowID: UInt32  // CGWindowID
+    let windowID: UInt32  // CGWindowID (may be synthetic for tabs)
+    let parentWindowID: UInt32?  // Original window ID if this is a tab (for clustering)
     let pid: pid_t
     let appName: String
     let title: String
     let frame: CGRect
     let isOnScreen: Bool
     var duplicateIndex: Int = 0  // 0-based index for windows with same title in same app
+    var isClusteredTab: Bool = false  // True if this is a non-frontmost tab in a cluster
 
     // Unique ID for SwiftUI (handles tabs sharing same windowID)
     var id: String {
@@ -873,49 +875,63 @@ class WindowManager: ObservableObject {
                 // Skip tiny windows
                 if frame.width < 100 || frame.height < 100 { continue }
 
-                // Add the main window
-                newWindows.append(WindowInfo(
-                    windowID: windowID,
-                    pid: pid,
-                    appName: appName,
-                    title: title,
-                    frame: frame,
-                    isOnScreen: isOnScreen
-                ))
-
-                // Check for tabs in this window and add them
+                // Check for tabs in this window
                 let tabTitles = getTabTitles(from: axWindow)
-                for tabTitle in tabTitles {
-                    // Skip if this tab is already the window title (it's the active tab)
-                    if tabTitle == title { continue }
 
-                    // Look up CGWindowID for this tab from our map
-                    // Background tabs should be in cgWindowInfo from CGWindowList
-                    var tabWindowID: UInt32? = nil
-                    for (cgID, cgInfo) in cgWindowInfo {
-                        if cgInfo.title == tabTitle || cgInfo.title.hasSuffix(tabTitle) {
-                            tabWindowID = cgID
-                            break
-                        }
-                    }
-
-                    // Add tab entry - generate synthetic ID if we can't find specific one
-                    let finalWindowID: UInt32
-                    if let found = tabWindowID {
-                        finalWindowID = found
-                    } else {
-                        // Generate unique synthetic ID for this tab
-                        syntheticIDCounter += 1
-                        finalWindowID = syntheticIDCounter
-                    }
+                if tabTitles.isEmpty {
+                    // No tabs - just add the window
                     newWindows.append(WindowInfo(
-                        windowID: finalWindowID,
+                        windowID: windowID,
+                        parentWindowID: nil,
                         pid: pid,
                         appName: appName,
-                        title: tabTitle,
-                        frame: frame,  // Use parent frame since background tabs aren't positioned
-                        isOnScreen: false
+                        title: title,
+                        frame: frame,
+                        isOnScreen: isOnScreen
                     ))
+                } else {
+                    // Has tabs - add each tab
+                    // The active tab is the one whose title matches or is contained in the window title
+                    var activeTabFound = false
+                    for tabTitle in tabTitles {
+                        // Check if this is the active tab (matches window title)
+                        let isActiveTab = !activeTabFound && (
+                            tabTitle == title ||
+                            title.contains(tabTitle) ||
+                            tabTitle.contains(title)
+                        )
+                        if isActiveTab { activeTabFound = true }
+
+                        // Look up CGWindowID for this tab from our map
+                        var tabWindowID: UInt32? = nil
+                        for (cgID, cgInfo) in cgWindowInfo {
+                            if cgInfo.title == tabTitle || cgInfo.title.hasSuffix(tabTitle) {
+                                tabWindowID = cgID
+                                break
+                            }
+                        }
+
+                        // For active tab, use the real window ID; others get synthetic
+                        let finalWindowID: UInt32
+                        if isActiveTab {
+                            finalWindowID = windowID
+                        } else if let found = tabWindowID {
+                            finalWindowID = found
+                        } else {
+                            syntheticIDCounter += 1
+                            finalWindowID = syntheticIDCounter
+                        }
+
+                        newWindows.append(WindowInfo(
+                            windowID: finalWindowID,
+                            parentWindowID: isActiveTab ? nil : windowID,  // Active tab is "main"
+                            pid: pid,
+                            appName: appName,
+                            title: tabTitle,
+                            frame: frame,
+                            isOnScreen: isActiveTab
+                        ))
+                    }
                 }
             }
         }
@@ -936,11 +952,66 @@ class WindowManager: ObservableObject {
             seenTitles[key] = count + 1
         }
 
+        // Cluster tabs: group windows from same app with same frame
+        // The frontmost tab stays in z-order position, others cluster after it
+        newWindows = clusterTabs(newWindows)
+
         DispatchQueue.main.async {
             self.windows = newWindows
             // Index content in background for instant search
             self.indexContentInBackground()
         }
+    }
+
+    /// Cluster tabs together: tabs with same parentWindowID are grouped
+    /// The frontmost tab (by z-order) stays in place, others follow immediately after
+    private func clusterTabs(_ windows: [WindowInfo]) -> [WindowInfo] {
+        // Build a map of parent window ID -> indices of child tabs
+        // Also track which windows are parents (have tabs pointing to them)
+        var tabsByParent: [UInt32: [Int]] = [:]
+        var parentIndices: [UInt32: Int] = [:]
+
+        for (index, window) in windows.enumerated() {
+            if let parentID = window.parentWindowID {
+                // This is a tab - group by parent
+                tabsByParent[parentID, default: []].append(index)
+            } else {
+                // This might be a parent window
+                parentIndices[window.windowID] = index
+            }
+        }
+
+        // If no tabs, return as-is
+        if tabsByParent.isEmpty {
+            return windows
+        }
+
+        // Build the clustered list
+        var result: [WindowInfo] = []
+        var consumed: Set<Int> = []
+
+        for (index, window) in windows.enumerated() {
+            if consumed.contains(index) {
+                continue
+            }
+
+            result.append(window)
+            consumed.insert(index)
+
+            // If this window has tabs, add them right after (indented)
+            if let tabIndices = tabsByParent[window.windowID] {
+                for tabIndex in tabIndices {
+                    if !consumed.contains(tabIndex) {
+                        var clusteredWindow = windows[tabIndex]
+                        clusteredWindow.isClusteredTab = true
+                        result.append(clusteredWindow)
+                        consumed.insert(tabIndex)
+                    }
+                }
+            }
+        }
+
+        return result
     }
 
     func thumbnail(for windowID: UInt32, maxSize: CGSize = CGSize(width: 200, height: 150)) async -> NSImage? {
@@ -1216,23 +1287,37 @@ class WindowManager: ObservableObject {
         let trueValue: CFTypeRef = kCFBooleanTrue
         AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, trueValue)
 
-        // After a brief delay, ensure the focused window actually has keyboard focus
-        // This is needed for apps with tabs where selecting a tab doesn't auto-focus content
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            // Get the app's focused window and set focus on it again
+        // Helper to ensure window has keyboard focus
+        func ensureFocus() {
             var focusedWindow: CFTypeRef?
             if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
-               let axWindow = focusedWindow {
+               let axWindow = focusedWindow as! AXUIElement? {
                 // Raise the window
-                AXUIElementPerformAction(axWindow as! AXUIElement, kAXRaiseAction as CFString)
+                AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
 
                 // Set it as main and focused
-                AXUIElementSetAttributeValue(axWindow as! AXUIElement, kAXMainAttribute as CFString, trueValue)
-                AXUIElementSetAttributeValue(axWindow as! AXUIElement, kAXFocusedAttribute as CFString, trueValue)
+                AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, trueValue)
+                AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, trueValue)
+
+                // Try to focus the first responder/content area directly
+                var focusedElement: CFTypeRef?
+                if AXUIElementCopyAttributeValue(axWindow, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success,
+                   let element = focusedElement as! AXUIElement? {
+                    AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, trueValue)
+                }
             }
 
             // Re-activate to ensure keyboard focus
             app.activate()
+        }
+
+        // Multiple retry attempts with increasing delays
+        // Some apps need more time for their window state to settle after tab switches
+        let delays: [Double] = [0.05, 0.1, 0.2]
+        for delay in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                ensureFocus()
+            }
         }
     }
 
@@ -1305,7 +1390,8 @@ struct WindowRow: View {
         }
         .buttonStyle(.plain)
         .padding(.vertical, 4)
-        .padding(.horizontal, 8)
+        .padding(.leading, window.isClusteredTab ? 20 : 8)  // Indent clustered tabs
+        .padding(.trailing, 8)
         .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
         .cornerRadius(6)
         .overlay(
@@ -1461,7 +1547,10 @@ struct SidebarView: View {
     }
 
     func activateSelected() {
-        if let windowID = manager.selectedWindowID {
+        // Use selected window, or first visible window if nothing selected
+        let windowID = manager.selectedWindowID ?? filteredWindows.first?.windowID
+
+        if let windowID = windowID {
             manager.bringToFront(windowID)
             searchText = ""
             // Hide sidebar after selecting a window
