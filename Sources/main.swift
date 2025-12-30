@@ -3,6 +3,7 @@ import SwiftUI
 import ScreenCaptureKit
 import Vision
 import KeyboardShortcuts
+import Sparkle
 
 // MARK: - Keyboard Shortcuts
 
@@ -1755,6 +1756,7 @@ struct SidebarView: View {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem?
+    let updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Setup global hotkey (Cmd+Shift+Space to focus switcher)
@@ -1885,6 +1887,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "Show Winby (\(AppConfig.shared.hotkeyDescription))", action: #selector(toggleSidebar), keyEquivalent: "")
         menu.addItem(.separator())
+        let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
+        updateItem.target = updaterController
+        menu.addItem(updateItem)
         menu.addItem(withTitle: "Preferences...", action: #selector(showSettings), keyEquivalent: ",")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit Winby", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
