@@ -96,6 +96,9 @@ func SLSGetWindowOwner(_ cid: Int32, _ wid: UInt32, _ owner_cid: UnsafeMutablePo
 @_silgen_name("SLSConnectionGetPID")
 func SLSConnectionGetPID(_ cid: Int32, _ pid: UnsafeMutablePointer<pid_t>) -> CGError
 
+@_silgen_name("SLSOrderWindow")
+func SLSOrderWindow(_ cid: Int32, _ wid: UInt32, _ mode: Int32, _ relativeToWid: UInt32) -> CGError
+
 // Private API to get CGWindowID from AXUIElement
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<UInt32>) -> AXError
@@ -1459,6 +1462,12 @@ class WindowManager: ObservableObject {
         var p = point
         _ = SLSMoveWindow(cid, windowID, &p)
     }
+
+    /// Raise window to front without activating it (for cycling preview)
+    func raiseWindow(_ windowID: UInt32) {
+        // SLSOrderWindow with mode 1 (kCGSOrderAbove) brings window to front
+        _ = SLSOrderWindow(cid, windowID, 1, 0)
+    }
 }
 
 // MARK: - SwiftUI Views
@@ -2461,9 +2470,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let nextIdx = (idx + 1) % windows.count
             manager.selectedWindowID = windows[nextIdx].windowID
         } else {
-            // Select first window
-            manager.selectedWindowID = windows[0].windowID
+            // First invocation: select window #2 (index 1) since #1 is the current window
+            // Just like standard Cmd+Tab behavior
+            let idx = windows.count > 1 ? 1 : 0
+            manager.selectedWindowID = windows[idx].windowID
         }
+
+        // Auto-raise the selected window while cycling (like standard Cmd+Tab)
+        raiseSelectedWindow()
     }
 
     func selectPreviousWindow() {
@@ -2477,9 +2491,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let prevIdx = idx > 0 ? idx - 1 : windows.count - 1
             manager.selectedWindowID = windows[prevIdx].windowID
         } else {
-            // Select last window
+            // First invocation going backward: select last window
             manager.selectedWindowID = windows[windows.count - 1].windowID
         }
+
+        // Auto-raise the selected window while cycling (like standard Cmd+Tab)
+        raiseSelectedWindow()
+    }
+
+    /// Raise the selected window without activating it (preview while cycling)
+    func raiseSelectedWindow() {
+        let manager = WindowManager.shared
+        guard let windowID = manager.selectedWindowID,
+              manager.windows.contains(where: { $0.windowID == windowID }) else { return }
+
+        // Raise window to front without activating (preview while cycling)
+        manager.raiseWindow(windowID)
     }
 
     func activateSelectedAndHide() {
