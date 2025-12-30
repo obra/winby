@@ -99,6 +99,25 @@ func SLSConnectionGetPID(_ cid: Int32, _ pid: UnsafeMutablePointer<pid_t>) -> CG
 @_silgen_name("SLSOrderWindow")
 func SLSOrderWindow(_ cid: Int32, _ wid: UInt32, _ mode: Int32, _ relativeToWid: UInt32) -> CGError
 
+// Private APIs for focusing specific windows (from AltTab/Hammerspoon)
+enum SLPSMode: UInt32 {
+    case allWindows = 0x100
+    case userGenerated = 0x200
+    case noWindows = 0x400
+}
+
+/// Brings a specific window of a process to front
+@_silgen_name("_SLPSSetFrontProcessWithOptions") @discardableResult
+func _SLPSSetFrontProcessWithOptions(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ wid: CGWindowID, _ mode: UInt32) -> CGError
+
+/// Sends bytes to the WindowServer (for making window key)
+@_silgen_name("SLPSPostEventRecordTo") @discardableResult
+func SLPSPostEventRecordTo(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ bytes: UnsafeMutablePointer<UInt8>) -> CGError
+
+/// Get process serial number from PID
+@_silgen_name("GetProcessForPID") @discardableResult
+func GetProcessForPID(_ pid: pid_t, _ psn: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+
 // Private API to get CGWindowID from AXUIElement
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<UInt32>) -> AXError
@@ -191,6 +210,7 @@ class WindowManager: ObservableObject {
 
     private let cid: Int32
     private var refreshTimer: Timer?
+    var isCycling = false  // When true, don't reorder windows during refresh
 
     /// Cached thumbnails - kept even when windows go to background
     var thumbnailCache: [UInt32: NSImage] = [:]
@@ -931,22 +951,13 @@ class WindowManager: ObservableObject {
                     for (index, tabTitle) in tabTitles.enumerated() {
                         let isActiveTab = (index == activeTabIndex)
 
-                        // Look up CGWindowID for this tab from our map
-                        var tabWindowID: UInt32? = nil
-                        for (cgID, cgInfo) in cgWindowInfo {
-                            if cgInfo.title == tabTitle || cgInfo.title.hasSuffix(tabTitle) {
-                                tabWindowID = cgID
-                                break
-                            }
-                        }
-
-                        // For active tab, use the real window ID; others get synthetic
+                        // For active tab, use the real window ID
+                        // For other tabs, always use synthetic IDs to avoid collisions
                         let finalWindowID: UInt32
                         if isActiveTab {
                             finalWindowID = windowID
-                        } else if let found = tabWindowID {
-                            finalWindowID = found
                         } else {
+                            // Always use synthetic IDs for non-active tabs to avoid duplicates
                             syntheticIDCounter += 1
                             finalWindowID = syntheticIDCounter
                         }
@@ -966,10 +977,27 @@ class WindowManager: ObservableObject {
         }
 
         // Sort by z-order (front to back), windows not in z-order map go to end
-        newWindows.sort { a, b in
-            let aOrder = zOrder[a.windowID] ?? Int.max
-            let bOrder = zOrder[b.windowID] ?? Int.max
-            return aOrder < bOrder
+        // But if we're cycling, preserve the current order to avoid jumping
+        if isCycling && !windows.isEmpty {
+            // Preserve existing order - sort new windows by their position in current list
+            // Use reduce to handle potential duplicate windowIDs (keep first occurrence)
+            var currentOrder: [UInt32: Int] = [:]
+            for (index, window) in windows.enumerated() {
+                if currentOrder[window.windowID] == nil {
+                    currentOrder[window.windowID] = index
+                }
+            }
+            newWindows.sort { a, b in
+                let aOrder = currentOrder[a.windowID] ?? Int.max
+                let bOrder = currentOrder[b.windowID] ?? Int.max
+                return aOrder < bOrder
+            }
+        } else {
+            newWindows.sort { a, b in
+                let aOrder = zOrder[a.windowID] ?? Int.max
+                let bOrder = zOrder[b.windowID] ?? Int.max
+                return aOrder < bOrder
+            }
         }
 
         // Compute duplicate indices for windows with same title in same app
@@ -1086,76 +1114,163 @@ class WindowManager: ObservableObject {
             return
         }
 
-        debugLog("Trying to raise window \(windowID) '\(window.title)' from \(window.appName)")
+        debugLog("Bringing to front: window \(windowID) '\(window.title)' from \(window.appName)")
 
-        // Use Accessibility API to raise the specific window
-        let appElement = AXUIElementCreateApplication(window.pid)
+        // Use the proper private APIs to focus this window
+        focusWindow(windowID)
 
-        // Get all windows for this app
-        var windowsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let axWindows = windowsRef as? [AXUIElement] else {
-            debugLog("Could not get AX windows, falling back to app activation")
-            bringAppToFront(pid: window.pid)
-            return
-        }
-
-        debugLog("Found \(axWindows.count) AX windows for pid \(window.pid)")
-
-        // Find the window matching our windowID using private API
-        for axWindow in axWindows {
-            var axWindowID: UInt32 = 0
-            let getWindowResult = _AXUIElementGetWindow(axWindow, &axWindowID)
-            debugLog("AX window has ID \(axWindowID), looking for \(windowID), result: \(getWindowResult.rawValue)")
-
-            if getWindowResult == .success && axWindowID == windowID {
-                // Found it! Try multiple approaches to raise it
-                debugLog("MATCH! Found AX window for windowID \(windowID)")
-
-                // Debug: print available actions
-                var actionsRef: CFTypeRef?
-                if AXUIElementCopyAttributeValue(axWindow, "AXActionNames" as CFString, &actionsRef) == .success {
-                    debugLog("Available actions: \(actionsRef ?? "none" as CFTypeRef)")
-                }
-
-                // 1. Try setting it as the main window
-                let trueValue: CFTypeRef = kCFBooleanTrue
-                let mainResult = AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, trueValue)
-                debugLog("Set main result: \(mainResult.rawValue)")
-
-                // 2. Also set it as focused
-                let focusResult = AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, trueValue)
-                debugLog("Set focused result: \(focusResult.rawValue)")
-
-                // 3. Try AXRaise action
-                let raiseResult = AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-                debugLog("Raise result: \(raiseResult.rawValue)")
-
-                // 4. Try AXPress action (works for some tab implementations)
-                let pressResult = AXUIElementPerformAction(axWindow, kAXPressAction as CFString)
-                debugLog("Press result: \(pressResult.rawValue)")
-
-                // 5. Bring app to front and activate it
-                bringAppToFront(pid: window.pid)
-                return
-            }
-        }
-
-        debugLog("No AX window matched windowID \(windowID), trying tab bar approach (index \(window.duplicateIndex))")
-
-        // For native tabs: search ALL windows in the app for the tab
-        // The tab might be in a different window than the currently visible one
-        for (idx, axWindow) in axWindows.enumerated() {
-            debugLog("Searching window \(idx + 1) of \(axWindows.count) for tab")
-            if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.duplicateIndex) {
-                bringAppToFront(pid: window.pid)
-                return
-            }
-        }
-
-        // Last fallback: just bring app to front
-        debugLog("All methods failed, just bringing app to front")
+        // Also ensure the app is activated and window gets keyboard focus
         bringAppToFront(pid: window.pid)
+    }
+
+    /// Try to select a tab using AppleScript (more reliable for Terminal, Safari, etc.)
+    /// Returns true if AppleScript worked, false if we need to fall back to AX
+    private func selectTabViaAppleScript(appName: String, pid: pid_t, tabTitle: String, tabIndex: Int) -> Bool {
+        // Get app bundle identifier for better matching
+        guard let app = NSRunningApplication(processIdentifier: pid) else {
+            return false
+        }
+        let bundleId = app.bundleIdentifier ?? ""
+
+        var script: String?
+
+        // Terminal.app
+        if bundleId == "com.apple.Terminal" || appName == "Terminal" {
+            // Terminal uses "selected tab" and "custom title" property
+            let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
+                                       .replacingOccurrences(of: "\"", with: "\\\"")
+            script = """
+            tell application "Terminal"
+                repeat with w in windows
+                    repeat with i from 1 to count of tabs of w
+                        set t to tab i of w
+                        set tabName to custom title of t
+                        if tabName contains "\(escapedTitle)" then
+                            set selected tab of w to t
+                            set index of w to 1
+                            return true
+                        end if
+                    end repeat
+                end repeat
+                return false
+            end tell
+            """
+        }
+        // Safari
+        else if bundleId == "com.apple.Safari" || appName == "Safari" {
+            script = """
+            tell application "Safari"
+                repeat with w in windows
+                    repeat with t from 1 to count of tabs of w
+                        set tabName to name of tab t of w
+                        if tabName contains "\(tabTitle.replacingOccurrences(of: "\"", with: "\\\""))" then
+                            set current tab of w to tab t of w
+                            set index of w to 1
+                            return true
+                        end if
+                    end repeat
+                end repeat
+                return false
+            end tell
+            """
+        }
+        // Chrome
+        else if bundleId == "com.google.Chrome" || appName.contains("Chrome") {
+            script = """
+            tell application "Google Chrome"
+                repeat with w in windows
+                    repeat with t from 1 to count of tabs of w
+                        set tabTitle to title of tab t of w
+                        if tabTitle contains "\(tabTitle.replacingOccurrences(of: "\"", with: "\\\""))" then
+                            set active tab index of w to t
+                            set index of w to 1
+                            return true
+                        end if
+                    end repeat
+                end repeat
+                return false
+            end tell
+            """
+        }
+        // Arc Browser
+        else if bundleId == "company.thebrowser.Browser" || appName == "Arc" {
+            // Arc has limited AppleScript support - try basic approach
+            script = """
+            tell application "Arc"
+                activate
+            end tell
+            """
+        }
+        // Ghostty - use System Events to click tabs
+        else if bundleId == "com.mitchellh.ghostty" || appName == "Ghostty" {
+            let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
+                                       .replacingOccurrences(of: "\"", with: "\\\"")
+            print("[Winby] Ghostty tab switch: looking for '\(tabTitle)' (escaped: '\(escapedTitle)')")
+            script = """
+            tell application "System Events"
+                tell process "Ghostty"
+                    set tabButtons to every radio button of tab group 1 of window 1
+                    repeat with t in tabButtons
+                        set tabTitle to title of t
+                        if tabTitle is "\(escapedTitle)" then
+                            click t
+                            return "clicked: " & tabTitle
+                        end if
+                    end repeat
+                    -- Return list of available tabs for debugging
+                    set availableTabs to {}
+                    repeat with t in tabButtons
+                        set end of availableTabs to title of t
+                    end repeat
+                    return "not found, available: " & (availableTabs as text)
+                end tell
+            end tell
+            """
+        }
+        // Generic fallback using System Events for apps with tab groups
+        else {
+            let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
+                                       .replacingOccurrences(of: "\"", with: "\\\"")
+            let escapedAppName = appName.replacingOccurrences(of: "\"", with: "\\\"")
+            script = """
+            tell application "System Events"
+                tell process "\(escapedAppName)"
+                    try
+                        set tabButtons to every radio button of tab group 1 of window 1
+                        repeat with t in tabButtons
+                            if title of t contains "\(escapedTitle)" then
+                                click t
+                                return true
+                            end if
+                        end repeat
+                    end try
+                end tell
+            end tell
+            return false
+            """
+        }
+
+        guard let scriptSource = script else {
+            return false
+        }
+
+        print("[Winby] Trying AppleScript tab switch for \(appName): looking for '\(tabTitle)'")
+
+        var error: NSDictionary?
+        if let appleScript = NSAppleScript(source: scriptSource) {
+            let result = appleScript.executeAndReturnError(&error)
+            if let error = error {
+                print("[Winby] AppleScript error: \(error)")
+                return false
+            }
+            // Log the result - could be bool or string depending on script
+            let resultStr = result.stringValue ?? (result.booleanValue ? "true" : "false")
+            print("[Winby] AppleScript result: \(resultStr)")
+            // Consider it successful if we got a "clicked" response or true
+            return resultStr.contains("clicked") || result.booleanValue
+        }
+
+        return false
     }
 
     /// Try to find and click a tab with the given title in the window's tab bar
@@ -1175,15 +1290,7 @@ class WindowManager: ObservableObject {
         var matchCount = 0
         let result = searchForTab(in: childElements, title: title, targetIndex: targetIndex, currentMatchCount: &matchCount, depth: 0)
 
-        if result {
-            // After clicking the tab, move focus to the window content (not the tab bar)
-            // This is critical - clicking a tab focuses the tab button, not the content
-            // We delay slightly to let the tab switch complete before clicking
-            let windowRef = window
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
-                focusWindowContent(windowRef)
-            }
-        } else {
+        if !result {
             // Collect available tab titles for debugging
             var availableTabs: [String] = []
             collectTabTitles(in: childElements, into: &availableTabs, depth: 0)
@@ -1194,37 +1301,6 @@ class WindowManager: ObservableObject {
         }
 
         return result
-    }
-
-    /// Move keyboard focus from tab bar to window content area
-    private func focusWindowContent(_ window: AXUIElement) {
-        // Get the window's position and size
-        var positionRef: CFTypeRef?
-        var sizeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef) == .success,
-              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success else {
-            return
-        }
-
-        var position = CGPoint.zero
-        var size = CGSize.zero
-        AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
-        AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
-
-        // Click in the center of the window, below the title/tab bar area (roughly 80px from top)
-        let clickPoint = CGPoint(
-            x: position.x + size.width / 2,
-            y: position.y + min(100, size.height / 2)  // 100px from top or center if window is small
-        )
-
-        debugLog("Clicking at \(clickPoint) to focus window content")
-
-        // Create and post a mouse click event
-        if let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: clickPoint, mouseButton: .left),
-           let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: clickPoint, mouseButton: .left) {
-            mouseDown.post(tap: .cghidEventTap)
-            mouseUp.post(tap: .cghidEventTap)
-        }
     }
 
     /// Collect all tab titles from the AX hierarchy for debugging
@@ -1347,13 +1423,20 @@ class WindowManager: ObservableObject {
             app.unhide()
         }
 
-        // Activate the app
-        app.activate()
-
-        // Also set it as the frontmost application via AX
+        // First, raise the frontmost window via AX (like Switch does)
         let appElement = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let axWindows = windowsRef as? [AXUIElement],
+           let frontWindow = axWindows.first {
+            AXUIElementPerformAction(frontWindow, kAXRaiseAction as CFString)
+        }
+
+        // Then activate the app (this updates the menu bar)
+        app.activate(options: [.activateIgnoringOtherApps])
+
+        // For setting AX attributes
         let trueValue: CFTypeRef = kCFBooleanTrue
-        AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, trueValue)
 
         // Find the main content area (text area, scroll area, etc.) in a window
         func findContentArea(in element: AXUIElement, depth: Int = 0) -> AXUIElement? {
@@ -1426,36 +1509,6 @@ class WindowManager: ObservableObject {
                 ensureFocus()
             }
         }
-
-        // Final fallback: synthetic click in the window center (after AX attempts)
-        // Some apps (especially terminals) need an actual input event to focus
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            var focusedWindow: CFTypeRef?
-            if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
-               let axWindow = focusedWindow as! AXUIElement? {
-                var positionRef: CFTypeRef?
-                var sizeRef: CFTypeRef?
-                if AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &positionRef) == .success,
-                   AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef) == .success {
-                    var position = CGPoint.zero
-                    var size = CGSize.zero
-                    AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
-                    AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
-
-                    // Click in center, below title bar
-                    let clickPoint = CGPoint(
-                        x: position.x + size.width / 2,
-                        y: position.y + min(100, size.height / 2)
-                    )
-                    if let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: clickPoint, mouseButton: .left),
-                       let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: clickPoint, mouseButton: .left) {
-                        mouseDown.post(tap: .cghidEventTap)
-                        mouseUp.post(tap: .cghidEventTap)
-                        debugLog("Posted synthetic click at \(clickPoint) as focus fallback")
-                    }
-                }
-            }
-        }
     }
 
     func moveWindow(_ windowID: UInt32, to point: CGPoint) {
@@ -1463,10 +1516,99 @@ class WindowManager: ObservableObject {
         _ = SLSMoveWindow(cid, windowID, &p)
     }
 
-    /// Raise window to front without activating it (for cycling preview)
-    func raiseWindow(_ windowID: UInt32) {
-        // SLSOrderWindow with mode 1 (kCGSOrderAbove) brings window to front
-        _ = SLSOrderWindow(cid, windowID, 1, 0)
+    /// Raise window visually for cycling preview (no focus steal)
+    func raiseWindowForPreview(_ windowID: UInt32) {
+        guard let window = windows.first(where: { $0.windowID == windowID }) else { return }
+
+        // For background tabs, we need to switch to the tab first
+        if window.parentWindowID != nil {
+            let appElement = AXUIElementCreateApplication(window.pid)
+            var windowsRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+               let axWindows = windowsRef as? [AXUIElement] {
+                for axWindow in axWindows {
+                    if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.duplicateIndex) {
+                        break
+                    }
+                }
+            }
+        }
+
+        // Use private API to bring window to front without making it key
+        // This raises the window visually but doesn't steal keyboard focus
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(window.pid, &psn)
+
+        let targetWindowID = window.parentWindowID ?? windowID
+        // Use allWindows mode - brings process to front with all its windows
+        _SLPSSetFrontProcessWithOptions(&psn, targetWindowID, SLPSMode.allWindows.rawValue)
+    }
+
+    /// Fully focus a window (used when committing selection)
+    func focusWindow(_ windowID: UInt32) {
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            debugLog("focusWindow: window \(windowID) not found")
+            return
+        }
+
+        print("[Winby] focusWindow: \(window.appName) '\(window.title)' parentWindowID=\(window.parentWindowID?.description ?? "nil")")
+
+        // For background tabs, switch to the tab first
+        var tabSwitchHandled = false
+        if window.parentWindowID != nil {
+            print("[Winby] focusWindow: this is a background tab, trying to switch")
+            // Try AppleScript first (more reliable for Terminal, Safari, etc.)
+            tabSwitchHandled = selectTabViaAppleScript(
+                appName: window.appName,
+                pid: window.pid,
+                tabTitle: window.title,
+                tabIndex: window.duplicateIndex
+            )
+            print("[Winby] focusWindow: AppleScript result = \(tabSwitchHandled)")
+
+            // Fall back to AX approach if AppleScript didn't work
+            if !tabSwitchHandled {
+                print("[Winby] focusWindow: trying AX fallback")
+                let appElement = AXUIElementCreateApplication(window.pid)
+                var windowsRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+                   let axWindows = windowsRef as? [AXUIElement] {
+                    for axWindow in axWindows {
+                        if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.duplicateIndex) {
+                            tabSwitchHandled = true
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        // If tab switch was handled by AppleScript/AX, just activate the app
+        // Otherwise use AXRaise + activate pattern (like Switch app does)
+        if tabSwitchHandled {
+            // AppleScript/AX already switched the tab - just bring app to front
+            bringAppToFront(pid: window.pid)
+        } else {
+            // Raise the specific window via AX, then activate the app
+            let appElement = AXUIElementCreateApplication(window.pid)
+            var windowsRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+               let axWindows = windowsRef as? [AXUIElement] {
+                // Find the window with matching ID and raise it
+                for axWindow in axWindows {
+                    var windowIDRef: UInt32 = 0
+                    if _AXUIElementGetWindow(axWindow, &windowIDRef) == .success,
+                       windowIDRef == windowID {
+                        AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+                        break
+                    }
+                }
+            }
+            // Activate the app to update menu bar
+            if let app = NSRunningApplication(processIdentifier: window.pid) {
+                app.activate(options: [.activateIgnoringOtherApps])
+            }
+        }
     }
 }
 
@@ -1934,6 +2076,95 @@ struct SidebarView: View {
     }
 }
 
+// MARK: - Preview Panel View
+
+struct PreviewPanelView: View {
+    @ObservedObject var manager = WindowManager.shared
+    @State private var previewImage: NSImage?
+    @State private var loadingTask: Task<Void, Never>?
+
+    var body: some View {
+        ZStack {
+            if let image = previewImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                // Show app icon as placeholder while loading
+                if let windowID = manager.selectedWindowID,
+                   let window = manager.windows.first(where: { $0.windowID == windowID }),
+                   let app = NSRunningApplication(processIdentifier: window.pid),
+                   let icon = app.icon {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 128, height: 128)
+                        .opacity(0.5)
+                } else {
+                    ProgressView()
+                        .scaleEffect(1.5)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.opacity(0.8))
+        .onChange(of: manager.selectedWindowID) { _, newValue in
+            loadPreview(for: newValue)
+        }
+        .onAppear {
+            loadPreview(for: manager.selectedWindowID)
+        }
+    }
+
+    private func loadPreview(for windowID: UInt32?) {
+        // Cancel any in-progress load
+        loadingTask?.cancel()
+
+        guard let windowID = windowID else {
+            previewImage = nil
+            return
+        }
+
+        loadingTask = Task {
+            // Capture at full resolution (up to screen size)
+            if let image = await captureWindowImage(windowID: windowID) {
+                if !Task.isCancelled {
+                    await MainActor.run {
+                        previewImage = image
+                    }
+                }
+            }
+        }
+    }
+
+    private func captureWindowImage(windowID: UInt32) async -> NSImage? {
+        // Get screen size for max capture dimensions
+        let screenSize = NSScreen.main?.frame.size ?? CGSize(width: 1920, height: 1080)
+
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            if let scWindow = content.windows.first(where: { $0.windowID == windowID }) {
+                let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+                let config = SCStreamConfiguration()
+                // Capture at up to 2x screen resolution for retina quality
+                config.width = Int(screenSize.width * 2)
+                config.height = Int(screenSize.height * 2)
+                config.scalesToFit = true
+                config.showsCursor = false
+
+                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                return NSImage(cgImage: cgImage, size: NSSize(width: CGFloat(cgImage.width) / 2, height: CGFloat(cgImage.height) / 2))
+            }
+        } catch {
+            debugLog("Preview capture failed: \(error)")
+        }
+
+        // Fallback: try to get from thumbnail cache
+        return await manager.thumbnail(for: windowID, maxSize: CGSize(width: 800, height: 600))
+    }
+}
+
 // MARK: - App Delegate
 
 // Global reference for CGEventTap callback
@@ -1941,6 +2172,7 @@ private var globalAppDelegate: AppDelegate?
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
+    var previewWindow: NSWindow?
     var statusItem: NSStatusItem?
     let updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
@@ -1954,6 +2186,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Track if we're in tab-cycling mode (second+ Tab press while Cmd held)
     var isTabCycling = false
+    // Temporarily set when raising windows to prevent auto-hide
+    var isRaisingWindow = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Setup global hotkey (Cmd+Shift+Space to focus switcher)
@@ -2029,11 +2263,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Keep window on top
-        panel.level = .floating
+        panel.level = .popUpMenu  // Higher than .floating to stay above activated apps
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         // Start hidden - user activates with hotkey
         panel.orderOut(nil)
+
+        // Create preview panel (centered on screen, shows large window preview)
+        setupPreviewWindow()
 
         // Auto-hide when window loses focus
         NotificationCenter.default.addObserver(
@@ -2080,6 +2317,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
+    func setupPreviewWindow() {
+        guard let screen = NSScreen.main else { return }
+        let screenFrame = screen.visibleFrame
+
+        // Calculate preview size (leave room for sidebar and margins)
+        let sidebarWidth: CGFloat = 280
+        let margin: CGFloat = 40
+        let availableWidth = screenFrame.width - sidebarWidth - margin * 2
+        let availableHeight = screenFrame.height - margin * 2
+        let previewWidth = min(availableWidth, availableHeight * 16 / 9)  // 16:9 aspect ratio max
+        let previewHeight = previewWidth * 9 / 16
+
+        let previewPanel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: previewWidth, height: previewHeight),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        previewWindow = previewPanel
+
+        previewPanel.isOpaque = false
+        previewPanel.backgroundColor = .clear
+        previewPanel.hasShadow = true
+        previewPanel.level = .popUpMenu
+        previewPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        // Add visual effect background
+        let visualEffect = NSVisualEffectView()
+        visualEffect.material = .hudWindow
+        visualEffect.state = .active
+        visualEffect.blendingMode = .behindWindow
+        visualEffect.wantsLayer = true
+        visualEffect.layer?.cornerRadius = 12
+        visualEffect.layer?.masksToBounds = true
+
+        let hostingView = NSHostingView(rootView: PreviewPanelView())
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+
+        visualEffect.addSubview(hostingView)
+        NSLayoutConstraint.activate([
+            hostingView.topAnchor.constraint(equalTo: visualEffect.topAnchor),
+            hostingView.bottomAnchor.constraint(equalTo: visualEffect.bottomAnchor),
+            hostingView.leadingAnchor.constraint(equalTo: visualEffect.leadingAnchor),
+            hostingView.trailingAnchor.constraint(equalTo: visualEffect.trailingAnchor)
+        ])
+
+        previewPanel.contentView = visualEffect
+
+        // Center the preview panel (accounting for sidebar on left)
+        let centerX = screenFrame.origin.x + sidebarWidth + (screenFrame.width - sidebarWidth - previewWidth) / 2
+        let centerY = screenFrame.origin.y + (screenFrame.height - previewHeight) / 2
+        previewPanel.setFrame(
+            NSRect(x: centerX, y: centerY, width: previewWidth, height: previewHeight),
+            display: true
+        )
+
+        previewPanel.orderOut(nil)
+    }
+
     @MainActor
     func createMenu() -> NSMenu {
         let menu = NSMenu()
@@ -2118,8 +2414,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func windowDidResignKey(_ notification: Notification) {
-        // Auto-hide when sidebar loses focus
-        hideSidebar()
+        // Don't auto-hide while sidebar is visible - we raise other windows during preview
+        // Only hide on explicit dismiss (Escape, Return, clicking a window, etc.)
     }
 
     @objc func toggleSidebar() {
@@ -2137,43 +2433,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Disable system hotkeys (like Cmd+Tab) while our switcher is active
         _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 1)  // 1 = disable
 
-        // Start off-screen to the left
+        // Position at left edge of screen
         window.setFrame(
             NSRect(
-                x: screenFrame.origin.x - 250,
+                x: screenFrame.origin.x,
                 y: screenFrame.origin.y,
                 width: 280,
                 height: screenFrame.height
             ),
             display: false
         )
-        window.orderFront(nil)
 
-        // Animate slide in
+        // Fade in
+        window.alphaValue = 0
+        window.orderFront(nil)
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.2
+            context.duration = 0.15
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().setFrame(
-                NSRect(
-                    x: screenFrame.origin.x,
-                    y: screenFrame.origin.y,
-                    width: 280,
-                    height: screenFrame.height
-                ),
-                display: true
-            )
+            window.animator().alphaValue = 1
         }
 
         window.makeKey()
         NSApp.activate(ignoringOtherApps: true)
+
+        // Show preview panel with fade in
+        if let preview = previewWindow {
+            preview.alphaValue = 0
+            preview.orderFront(nil)
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                preview.animator().alphaValue = 1
+            }
+        }
     }
 
     func hideSidebar() {
-        guard let screen = NSScreen.main else { return }
-        let screenFrame = screen.visibleFrame
-
         // Clear cycling state
         isTabCycling = false
+        WindowManager.shared.isCycling = false
 
         // Re-enable system hotkeys
         _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 0)  // 0 = enable
@@ -2181,19 +2478,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Reset sidebar state
         WindowManager.shared.sidebarResetTrigger.toggle()
 
-        // Animate slide out
+        // Hide preview panel with fade out
+        if let preview = previewWindow {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.15
+                preview.animator().alphaValue = 0
+            }, completionHandler: {
+                preview.orderOut(nil)
+            })
+        }
+
+        // Fade out sidebar
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.2
+            context.duration = 0.15
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            window.animator().setFrame(
-                NSRect(
-                    x: screenFrame.origin.x - 250,
-                    y: screenFrame.origin.y,
-                    width: 280,
-                    height: screenFrame.height
-                ),
-                display: true
-            )
+            self.window.animator().alphaValue = 0
         }, completionHandler: {
             self.window.orderOut(nil)
         })
@@ -2266,6 +2565,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     if appDelegate.window.isVisible {
                         // Second+ press: enter cycling mode
                         appDelegate.isTabCycling = true
+                        WindowManager.shared.isCycling = true
                         appDelegate.selectNextWindow()
                     } else {
                         // First press: show sidebar, do NOT enter cycling mode
@@ -2309,6 +2609,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if self.window.isVisible {
                     // Second+ press: enter cycling mode
                     self.isTabCycling = true
+                    WindowManager.shared.isCycling = true
                     if goBackward {
                         self.selectPreviousWindow()
                     } else {
@@ -2443,6 +2744,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     } else {
                         // Second+ shortcut press while visible: NOW enter cycling mode
                         self.isTabCycling = true
+                        WindowManager.shared.isCycling = true
                         if isShift {
                             self.selectPreviousWindow()
                         } else {
@@ -2475,9 +2777,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let idx = windows.count > 1 ? 1 : 0
             manager.selectedWindowID = windows[idx].windowID
         }
-
-        // Auto-raise the selected window while cycling (like standard Cmd+Tab)
-        raiseSelectedWindow()
     }
 
     func selectPreviousWindow() {
@@ -2494,19 +2793,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // First invocation going backward: select last window
             manager.selectedWindowID = windows[windows.count - 1].windowID
         }
-
-        // Auto-raise the selected window while cycling (like standard Cmd+Tab)
-        raiseSelectedWindow()
-    }
-
-    /// Raise the selected window without activating it (preview while cycling)
-    func raiseSelectedWindow() {
-        let manager = WindowManager.shared
-        guard let windowID = manager.selectedWindowID,
-              manager.windows.contains(where: { $0.windowID == windowID }) else { return }
-
-        // Raise window to front without activating (preview while cycling)
-        manager.raiseWindow(windowID)
     }
 
     func activateSelectedAndHide() {
