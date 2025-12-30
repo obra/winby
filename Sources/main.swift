@@ -273,8 +273,10 @@ class WindowManager: ObservableObject {
     }
 
     /// Get tab titles from a window's tab group
-    private func getTabTitles(from window: AXUIElement) -> [String] {
+    /// Returns (tab titles, index of selected tab) - selectedIndex is -1 if unknown
+    private func getTabTitles(from window: AXUIElement) -> (titles: [String], selectedIndex: Int) {
         var tabs: [String] = []
+        var selectedIndex: Int = -1
 
         // Look for AXTabGroup in children
         func findTabs(in element: AXUIElement, depth: Int = 0) {
@@ -289,11 +291,18 @@ class WindowManager: ObservableObject {
                     var tabsRef: CFTypeRef?
                     if AXUIElementCopyAttributeValue(element, kAXTabsAttribute as CFString, &tabsRef) == .success,
                        let tabElements = tabsRef as? [AXUIElement] {
-                        for tab in tabElements {
+                        for (index, tab) in tabElements.enumerated() {
                             var titleRef: CFTypeRef?
                             if AXUIElementCopyAttributeValue(tab, kAXTitleAttribute as CFString, &titleRef) == .success,
                                let title = titleRef as? String, !title.isEmpty {
                                 tabs.append(title)
+
+                                // Check if this tab is selected (via value attribute = 1)
+                                var valueRef: CFTypeRef?
+                                if AXUIElementCopyAttributeValue(tab, kAXValueAttribute as CFString, &valueRef) == .success,
+                                   let value = valueRef as? Int, value == 1 {
+                                    selectedIndex = index
+                                }
                             }
                         }
                     }
@@ -305,7 +314,7 @@ class WindowManager: ObservableObject {
                     var childrenRef: CFTypeRef?
                     if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
                        let children = childrenRef as? [AXUIElement] {
-                        for child in children {
+                        for (index, child) in children.enumerated() {
                             var childRoleRef: CFTypeRef?
                             if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &childRoleRef) == .success,
                                let childRole = childRoleRef as? String,
@@ -314,6 +323,13 @@ class WindowManager: ObservableObject {
                                 if AXUIElementCopyAttributeValue(child, kAXTitleAttribute as CFString, &titleRef) == .success,
                                    let title = titleRef as? String, !title.isEmpty {
                                     tabs.append(title)
+
+                                    // Check if this radio button is selected
+                                    var valueRef: CFTypeRef?
+                                    if AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &valueRef) == .success,
+                                       let value = valueRef as? Int, value == 1 {
+                                        selectedIndex = index
+                                    }
                                 }
                             }
                         }
@@ -333,7 +349,7 @@ class WindowManager: ObservableObject {
         }
 
         findTabs(in: window)
-        return tabs
+        return (tabs, selectedIndex)
     }
 
     /// Enable accessibility for Electron/Chrome apps that require it
@@ -876,7 +892,8 @@ class WindowManager: ObservableObject {
                 if frame.width < 100 || frame.height < 100 { continue }
 
                 // Check for tabs in this window
-                let tabTitles = getTabTitles(from: axWindow)
+                let tabInfo = getTabTitles(from: axWindow)
+                let tabTitles = tabInfo.titles
 
                 if tabTitles.isEmpty {
                     // No tabs - just add the window
@@ -891,16 +908,25 @@ class WindowManager: ObservableObject {
                     ))
                 } else {
                     // Has tabs - add each tab
-                    // The active tab is the one whose title matches or is contained in the window title
-                    var activeTabFound = false
-                    for tabTitle in tabTitles {
-                        // Check if this is the active tab (matches window title)
-                        let isActiveTab = !activeTabFound && (
-                            tabTitle == title ||
-                            title.contains(tabTitle) ||
-                            tabTitle.contains(title)
-                        )
-                        if isActiveTab { activeTabFound = true }
+                    // Determine which tab is active:
+                    // 1. Use AX selected index if available
+                    // 2. Fall back to title matching
+                    // 3. Default to first tab if neither works
+                    var activeTabIndex = tabInfo.selectedIndex
+                    if activeTabIndex < 0 {
+                        // Try title matching as fallback
+                        for (index, tabTitle) in tabTitles.enumerated() {
+                            if tabTitle == title || title.contains(tabTitle) || tabTitle.contains(title) {
+                                activeTabIndex = index
+                                break
+                            }
+                        }
+                    }
+                    // If still unknown, use first tab as active
+                    if activeTabIndex < 0 { activeTabIndex = 0 }
+
+                    for (index, tabTitle) in tabTitles.enumerated() {
+                        let isActiveTab = (index == activeTabIndex)
 
                         // Look up CGWindowID for this tab from our map
                         var tabWindowID: UInt32? = nil
@@ -1146,7 +1172,15 @@ class WindowManager: ObservableObject {
         var matchCount = 0
         let result = searchForTab(in: childElements, title: title, targetIndex: targetIndex, currentMatchCount: &matchCount, depth: 0)
 
-        if !result {
+        if result {
+            // After clicking the tab, move focus to the window content (not the tab bar)
+            // This is critical - clicking a tab focuses the tab button, not the content
+            // We delay slightly to let the tab switch complete before clicking
+            let windowRef = window
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
+                focusWindowContent(windowRef)
+            }
+        } else {
             // Collect available tab titles for debugging
             var availableTabs: [String] = []
             collectTabTitles(in: childElements, into: &availableTabs, depth: 0)
@@ -1157,6 +1191,37 @@ class WindowManager: ObservableObject {
         }
 
         return result
+    }
+
+    /// Move keyboard focus from tab bar to window content area
+    private func focusWindowContent(_ window: AXUIElement) {
+        // Get the window's position and size
+        var positionRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success else {
+            return
+        }
+
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
+        AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+
+        // Click in the center of the window, below the title/tab bar area (roughly 80px from top)
+        let clickPoint = CGPoint(
+            x: position.x + size.width / 2,
+            y: position.y + min(100, size.height / 2)  // 100px from top or center if window is small
+        )
+
+        debugLog("Clicking at \(clickPoint) to focus window content")
+
+        // Create and post a mouse click event
+        if let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: clickPoint, mouseButton: .left),
+           let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: clickPoint, mouseButton: .left) {
+            mouseDown.post(tap: .cghidEventTap)
+            mouseUp.post(tap: .cghidEventTap)
+        }
     }
 
     /// Collect all tab titles from the AX hierarchy for debugging
