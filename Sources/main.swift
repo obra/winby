@@ -1352,6 +1352,33 @@ class WindowManager: ObservableObject {
         let trueValue: CFTypeRef = kCFBooleanTrue
         AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, trueValue)
 
+        // Find the main content area (text area, scroll area, etc.) in a window
+        func findContentArea(in element: AXUIElement, depth: Int = 0) -> AXUIElement? {
+            guard depth < 8 else { return nil }
+
+            var roleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+            let role = roleRef as? String ?? ""
+
+            // These roles typically represent the main content area
+            if role == "AXTextArea" || role == "AXWebArea" || (role == "AXGroup" && depth > 2) {
+                return element
+            }
+
+            // Recurse into children
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                // Prefer larger children (main content is usually bigger)
+                for child in children {
+                    if let found = findContentArea(in: child, depth: depth + 1) {
+                        return found
+                    }
+                }
+            }
+            return nil
+        }
+
         // Helper to ensure window has keyboard focus
         func ensureFocus() {
             var focusedWindow: CFTypeRef?
@@ -1364,11 +1391,23 @@ class WindowManager: ObservableObject {
                 AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, trueValue)
                 AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, trueValue)
 
-                // Try to focus the first responder/content area directly
-                var focusedElement: CFTypeRef?
-                if AXUIElementCopyAttributeValue(axWindow, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success,
-                   let element = focusedElement as! AXUIElement? {
-                    AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, trueValue)
+                // Try to find and focus the content area directly
+                if let contentArea = findContentArea(in: axWindow) {
+                    var roleRef: CFTypeRef?
+                    AXUIElementCopyAttributeValue(contentArea, kAXRoleAttribute as CFString, &roleRef)
+                    debugLog("Found content area with role: \(roleRef as? String ?? "unknown")")
+                    AXUIElementSetAttributeValue(contentArea, kAXFocusedAttribute as CFString, trueValue)
+                } else {
+                    debugLog("No content area found, using focused element fallback")
+                    // Fallback: try to focus whatever is currently focused
+                    var focusedElement: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(axWindow, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success,
+                       let element = focusedElement as! AXUIElement? {
+                        var roleRef: CFTypeRef?
+                        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+                        debugLog("Focusing element with role: \(roleRef as? String ?? "unknown")")
+                        AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, trueValue)
+                    }
                 }
             }
 
@@ -1382,6 +1421,36 @@ class WindowManager: ObservableObject {
         for delay in delays {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 ensureFocus()
+            }
+        }
+
+        // Final fallback: synthetic click in the window center (after AX attempts)
+        // Some apps (especially terminals) need an actual input event to focus
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            var focusedWindow: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+               let axWindow = focusedWindow as! AXUIElement? {
+                var positionRef: CFTypeRef?
+                var sizeRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &positionRef) == .success,
+                   AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef) == .success {
+                    var position = CGPoint.zero
+                    var size = CGSize.zero
+                    AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
+                    AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+
+                    // Click in center, below title bar
+                    let clickPoint = CGPoint(
+                        x: position.x + size.width / 2,
+                        y: position.y + min(100, size.height / 2)
+                    )
+                    if let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: clickPoint, mouseButton: .left),
+                       let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: clickPoint, mouseButton: .left) {
+                        mouseDown.post(tap: .cghidEventTap)
+                        mouseUp.post(tap: .cghidEventTap)
+                        debugLog("Posted synthetic click at \(clickPoint) as focus fallback")
+                    }
+                }
             }
         }
     }
