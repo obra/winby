@@ -166,6 +166,7 @@ struct WindowInfo: Identifiable, Hashable {
     let title: String
     let frame: CGRect
     let isOnScreen: Bool
+    var tabIndex: Int = 0  // 0-based tab position within window (for tab switching)
     var duplicateIndex: Int = 0  // 0-based index for windows with same title in same app
     var isClusteredTab: Bool = false  // True if this is a non-frontmost tab in a cluster
 
@@ -214,6 +215,19 @@ class WindowManager: ObservableObject {
 
     /// Cached thumbnails - kept even when windows go to background
     var thumbnailCache: [UInt32: NSImage] = [:]
+
+    /// Tab screenshot cache - keyed by "pid:title" for background tabs
+    /// When a tab is visible, we cache its screenshot here so we can show it when it's backgrounded
+    var tabScreenshotCache: [String: NSImage] = [:]
+
+    /// Tab OCR cache - keyed by "pid:title" for background tabs
+    /// When a tab is visible, we cache its OCR text here for search when it's backgrounded
+    var tabOcrCache: [String: String] = [:]
+
+    /// Helper to generate tab cache key
+    private func tabCacheKey(pid: pid_t, title: String) -> String {
+        return "\(pid):\(title)"
+    }
 
     /// Cached window content for search (windowID -> content snippet)
     var contentCache: [UInt32: String] = [:]
@@ -373,6 +387,80 @@ class WindowManager: ObservableObject {
 
         findTabs(in: window)
         return (tabs, selectedIndex)
+    }
+
+    /// Get browser tabs via AppleScript (Safari, Chrome, Arc have native scripting support)
+    /// Returns (tabTitles, selectedIndex) or nil if not a supported browser
+    private func getBrowserTabs(bundleId: String, appName: String) -> (titles: [String], selectedIndex: Int)? {
+        var script: String?
+
+        if bundleId == "com.apple.Safari" || appName == "Safari" {
+            script = """
+            tell application "Safari"
+                set tabInfo to {}
+                set selectedIdx to -1
+                repeat with w in windows
+                    set tabCount to count of tabs of w
+                    set currentTab to current tab of w
+                    repeat with i from 1 to tabCount
+                        set t to tab i of w
+                        set tabName to name of t
+                        set end of tabInfo to tabName
+                        if t is currentTab then
+                            set selectedIdx to (i - 1)
+                        end if
+                    end repeat
+                    -- Only process first window
+                    exit repeat
+                end repeat
+                return {tabInfo, selectedIdx}
+            end tell
+            """
+        } else if bundleId == "com.google.Chrome" || appName.contains("Chrome") {
+            script = """
+            tell application "Google Chrome"
+                set tabInfo to {}
+                set selectedIdx to -1
+                repeat with w in windows
+                    set tabCount to count of tabs of w
+                    set activeIdx to active tab index of w
+                    repeat with i from 1 to tabCount
+                        set tabTitle to title of tab i of w
+                        set end of tabInfo to tabTitle
+                    end repeat
+                    set selectedIdx to (activeIdx - 1)
+                    exit repeat
+                end repeat
+                return {tabInfo, selectedIdx}
+            end tell
+            """
+        }
+
+        guard let scriptSource = script else { return nil }
+
+        var error: NSDictionary?
+        guard let appleScript = NSAppleScript(source: scriptSource) else { return nil }
+
+        let result = appleScript.executeAndReturnError(&error)
+        if error != nil { return nil }
+
+        // Parse result - it's a list containing {tabTitles, selectedIndex}
+        guard result.numberOfItems >= 2 else { return nil }
+
+        let tabListDesc = result.atIndex(1)
+        let selectedIdxDesc = result.atIndex(2)
+
+        var titles: [String] = []
+        if let tabList = tabListDesc {
+            for i in 1...tabList.numberOfItems {
+                if let item = tabList.atIndex(i), let title = item.stringValue {
+                    titles.append(title)
+                }
+            }
+        }
+
+        let selectedIdx = selectedIdxDesc?.int32Value ?? -1
+        return (titles, Int(selectedIdx))
     }
 
     /// Enable accessibility for Electron/Chrome apps that require it
@@ -628,6 +716,22 @@ class WindowManager: ObservableObject {
     /// Get content via OCR from a full-size window capture
     /// Returns nil if capture failed, returns cached content if screenshot unchanged
     func getWindowContentViaOCR(windowID: UInt32) async -> String? {
+        // Get window info
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            return nil
+        }
+
+        let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+
+        // For background tabs, check tabOcrCache first
+        if window.parentWindowID != nil {
+            if let cached = tabOcrCache[cacheKey] {
+                return cached
+            }
+            // Background tabs can't be captured - no content available
+            return nil
+        }
+
         // Capture at higher resolution for OCR (thumbnails are too small)
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -661,6 +765,8 @@ class WindowManager: ObservableObject {
                 // Update hash for next comparison
                 await MainActor.run {
                     screenshotHashes[windowID] = newHash
+                    // Also cache by pid+title for when this becomes a background tab
+                    tabOcrCache[cacheKey] = text
                 }
                 return text
             }
@@ -915,7 +1021,15 @@ class WindowManager: ObservableObject {
                 if frame.width < 100 || frame.height < 100 { continue }
 
                 // Check for tabs in this window
-                let tabInfo = getTabTitles(from: axWindow)
+                // Try browser-specific AppleScript first (Safari, Chrome, Arc)
+                // Fall back to AX-based detection for other apps
+                let bundleId = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+                let tabInfo: (titles: [String], selectedIndex: Int)
+                if let browserTabs = getBrowserTabs(bundleId: bundleId, appName: appName) {
+                    tabInfo = browserTabs
+                } else {
+                    tabInfo = getTabTitles(from: axWindow)
+                }
                 let tabTitles = tabInfo.titles
 
                 if tabTitles.isEmpty {
@@ -952,17 +1066,22 @@ class WindowManager: ObservableObject {
                         let isActiveTab = (index == activeTabIndex)
 
                         // For active tab, use the real window ID
-                        // For other tabs, always use synthetic IDs to avoid collisions
+                        // For other tabs, use stable synthetic IDs based on content
                         let finalWindowID: UInt32
                         if isActiveTab {
                             finalWindowID = windowID
                         } else {
-                            // Always use synthetic IDs for non-active tabs to avoid duplicates
-                            syntheticIDCounter += 1
-                            finalWindowID = syntheticIDCounter
+                            // Generate stable synthetic ID from parent + title + index
+                            // This ensures the same tab gets the same ID across refreshes
+                            let stableKey = "\(windowID):\(tabTitle):\(index)"
+                            var hasher = Hasher()
+                            hasher.combine(stableKey)
+                            let hash = hasher.finalize()
+                            // Use high bits to avoid collision with real window IDs
+                            finalWindowID = UInt32(truncatingIfNeeded: UInt(bitPattern: hash)) | 0x80000000
                         }
 
-                        newWindows.append(WindowInfo(
+                        var windowInfo = WindowInfo(
                             windowID: finalWindowID,
                             parentWindowID: isActiveTab ? nil : windowID,  // Active tab is "main"
                             pid: pid,
@@ -970,7 +1089,9 @@ class WindowManager: ObservableObject {
                             title: tabTitle,
                             frame: frame,
                             isOnScreen: isActiveTab
-                        ))
+                        )
+                        windowInfo.tabIndex = index
+                        newWindows.append(windowInfo)
                     }
                 }
             }
@@ -1077,12 +1198,32 @@ class WindowManager: ObservableObject {
             return cached
         }
 
-        // Try ScreenCaptureKit
+        // Get window info
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            return nil
+        }
+
+        // For background tabs, check tab screenshot cache first
+        if window.parentWindowID != nil {
+            let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+            if let cached = tabScreenshotCache[cacheKey] {
+                return cached
+            }
+            // Background tabs can't be captured directly - fall back to app icon
+            if let app = NSRunningApplication(processIdentifier: window.pid),
+               let icon = app.icon {
+                return icon
+            }
+            return nil
+        }
+
+        // Try ScreenCaptureKit for visible windows
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
             if let scWindow = content.windows.first(where: { $0.windowID == windowID }) {
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let config = SCStreamConfiguration()
+                // Capture at higher resolution for quality
                 config.width = Int(maxSize.width * 2)
                 config.height = Int(maxSize.height * 2)
                 config.scalesToFit = true
@@ -1091,6 +1232,19 @@ class WindowManager: ObservableObject {
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
                 let nsImage = NSImage(cgImage: image, size: maxSize)
                 thumbnailCache[windowID] = nsImage
+
+                // Cache full resolution version for background tab use
+                let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+                let fullResConfig = SCStreamConfiguration()
+                fullResConfig.width = Int(scWindow.frame.width * 2)  // Retina
+                fullResConfig.height = Int(scWindow.frame.height * 2)
+                fullResConfig.scalesToFit = false
+                fullResConfig.showsCursor = false
+                if let fullResImage = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: fullResConfig) {
+                    let fullResNsImage = NSImage(cgImage: fullResImage, size: scWindow.frame.size)
+                    tabScreenshotCache[cacheKey] = fullResNsImage
+                }
+
                 return nsImage
             }
         } catch {
@@ -1099,8 +1253,7 @@ class WindowManager: ObservableObject {
         }
 
         // Fallback: use app icon
-        if let window = windows.first(where: { $0.windowID == windowID }),
-           let app = NSRunningApplication(processIdentifier: window.pid),
+        if let app = NSRunningApplication(processIdentifier: window.pid),
            let icon = app.icon {
             return icon
         }
@@ -1126,148 +1279,116 @@ class WindowManager: ObservableObject {
     /// Try to select a tab using AppleScript (more reliable for Terminal, Safari, etc.)
     /// Returns true if AppleScript worked, false if we need to fall back to AX
     private func selectTabViaAppleScript(appName: String, pid: pid_t, tabTitle: String, tabIndex: Int) -> Bool {
-        // Get app bundle identifier for better matching
-        guard let app = NSRunningApplication(processIdentifier: pid) else {
-            return false
-        }
-        let bundleId = app.bundleIdentifier ?? ""
+        let bundleId = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+        let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
+                                   .replacingOccurrences(of: "\"", with: "\\\"")
+        let targetIndex = tabIndex + 1  // AppleScript is 1-indexed
 
-        var script: String?
+        var script: String
 
-        // Terminal.app
-        if bundleId == "com.apple.Terminal" || appName == "Terminal" {
-            // Terminal uses "selected tab" and "custom title" property
-            let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
-                                       .replacingOccurrences(of: "\"", with: "\\\"")
-            script = """
-            tell application "Terminal"
-                repeat with w in windows
-                    repeat with i from 1 to count of tabs of w
-                        set t to tab i of w
-                        set tabName to custom title of t
-                        if tabName contains "\(escapedTitle)" then
-                            set selected tab of w to t
-                            set index of w to 1
-                            return true
-                        end if
-                    end repeat
-                end repeat
-                return false
-            end tell
-            """
-        }
-        // Safari
-        else if bundleId == "com.apple.Safari" || appName == "Safari" {
+        // Use native AppleScript for browsers (they have proper scripting support)
+        if bundleId == "com.apple.Safari" || appName == "Safari" {
+            print("[Winby] Safari tab switch: '\(tabTitle)' at index \(targetIndex)")
             script = """
             tell application "Safari"
                 repeat with w in windows
-                    repeat with t from 1 to count of tabs of w
-                        set tabName to name of tab t of w
-                        if tabName contains "\(tabTitle.replacingOccurrences(of: "\"", with: "\\\""))" then
-                            set current tab of w to tab t of w
-                            set index of w to 1
-                            return true
+                    set tabCount to count of tabs of w
+                    -- Try by index first
+                    if \(targetIndex) ≤ tabCount then
+                        set t to tab \(targetIndex) of w
+                        set current tab of w to t
+                        return "clicked by index: " & (name of t)
+                    end if
+                    -- Fall back to title match
+                    repeat with i from 1 to tabCount
+                        set t to tab i of w
+                        if name of t contains "\(escapedTitle)" then
+                            set current tab of w to t
+                            return "clicked by title: " & (name of t)
                         end if
                     end repeat
+                    exit repeat
                 end repeat
-                return false
+                return "not found"
             end tell
             """
-        }
-        // Chrome
-        else if bundleId == "com.google.Chrome" || appName.contains("Chrome") {
+        } else if bundleId == "com.google.Chrome" || appName.contains("Chrome") {
+            print("[Winby] Chrome tab switch: '\(tabTitle)' at index \(targetIndex)")
             script = """
             tell application "Google Chrome"
                 repeat with w in windows
-                    repeat with t from 1 to count of tabs of w
-                        set tabTitle to title of tab t of w
-                        if tabTitle contains "\(tabTitle.replacingOccurrences(of: "\"", with: "\\\""))" then
-                            set active tab index of w to t
-                            set index of w to 1
-                            return true
+                    set tabCount to count of tabs of w
+                    -- Try by index first
+                    if \(targetIndex) ≤ tabCount then
+                        set active tab index of w to \(targetIndex)
+                        return "clicked by index: " & (title of tab \(targetIndex) of w)
+                    end if
+                    -- Fall back to title match
+                    repeat with i from 1 to tabCount
+                        if title of tab i of w contains "\(escapedTitle)" then
+                            set active tab index of w to i
+                            return "clicked by title: " & (title of tab i of w)
                         end if
                     end repeat
+                    exit repeat
                 end repeat
-                return false
+                return "not found"
             end tell
             """
-        }
-        // Arc Browser
-        else if bundleId == "company.thebrowser.Browser" || appName == "Arc" {
-            // Arc has limited AppleScript support - try basic approach
-            script = """
-            tell application "Arc"
-                activate
-            end tell
-            """
-        }
-        // Ghostty - use System Events to click tabs
-        else if bundleId == "com.mitchellh.ghostty" || appName == "Ghostty" {
-            let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
-                                       .replacingOccurrences(of: "\"", with: "\\\"")
-            print("[Winby] Ghostty tab switch: looking for '\(tabTitle)' (escaped: '\(escapedTitle)')")
-            script = """
-            tell application "System Events"
-                tell process "Ghostty"
-                    set tabButtons to every radio button of tab group 1 of window 1
-                    repeat with t in tabButtons
-                        set tabTitle to title of t
-                        if tabTitle is "\(escapedTitle)" then
-                            click t
-                            return "clicked: " & tabTitle
-                        end if
-                    end repeat
-                    -- Return list of available tabs for debugging
-                    set availableTabs to {}
-                    repeat with t in tabButtons
-                        set end of availableTabs to title of t
-                    end repeat
-                    return "not found, available: " & (availableTabs as text)
-                end tell
-            end tell
-            """
-        }
-        // Generic fallback using System Events for apps with tab groups
-        else {
-            let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
-                                       .replacingOccurrences(of: "\"", with: "\\\"")
+        } else {
+            // For native apps (Terminal, Ghostty, etc), use System Events
             let escapedAppName = appName.replacingOccurrences(of: "\"", with: "\\\"")
+            print("[Winby] System Events tab switch for \(appName): '\(tabTitle)' at index \(targetIndex)")
             script = """
             tell application "System Events"
                 tell process "\(escapedAppName)"
                     try
                         set tabButtons to every radio button of tab group 1 of window 1
-                        repeat with t in tabButtons
-                            if title of t contains "\(escapedTitle)" then
+                        set tabCount to count of tabButtons
+
+                        -- First try by index (handles duplicate titles)
+                        if \(targetIndex) ≤ tabCount then
+                            set t to item \(targetIndex) of tabButtons
+                            set tabName to title of t
+                            if tabName contains "\(escapedTitle)" then
                                 click t
-                                return true
+                                return "clicked by index " & \(targetIndex) & ": " & tabName
+                            end if
+                        end if
+
+                        -- Fall back to title matching
+                        repeat with t in tabButtons
+                            set tabName to title of t
+                            if tabName contains "\(escapedTitle)" then
+                                click t
+                                return "clicked by title: " & tabName
                             end if
                         end repeat
+
+                        -- Debug: list available tabs
+                        set availableTabs to {}
+                        repeat with t in tabButtons
+                            set end of availableTabs to title of t
+                        end repeat
+                        return "not found in " & tabCount & " tabs: " & (availableTabs as text)
+                    on error errMsg
+                        return "error: " & errMsg
                     end try
                 end tell
             end tell
-            return false
             """
         }
 
-        guard let scriptSource = script else {
-            return false
-        }
-
-        print("[Winby] Trying AppleScript tab switch for \(appName): looking for '\(tabTitle)'")
-
         var error: NSDictionary?
-        if let appleScript = NSAppleScript(source: scriptSource) {
+        if let appleScript = NSAppleScript(source: script) {
             let result = appleScript.executeAndReturnError(&error)
             if let error = error {
                 print("[Winby] AppleScript error: \(error)")
                 return false
             }
-            // Log the result - could be bool or string depending on script
-            let resultStr = result.stringValue ?? (result.booleanValue ? "true" : "false")
+            let resultStr = result.stringValue ?? "unknown"
             print("[Winby] AppleScript result: \(resultStr)")
-            // Consider it successful if we got a "clicked" response or true
-            return resultStr.contains("clicked") || result.booleanValue
+            return resultStr.contains("clicked")
         }
 
         return false
@@ -1527,7 +1648,7 @@ class WindowManager: ObservableObject {
             if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
                let axWindows = windowsRef as? [AXUIElement] {
                 for axWindow in axWindows {
-                    if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.duplicateIndex) {
+                    if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.tabIndex) {
                         break
                     }
                 }
@@ -1562,7 +1683,7 @@ class WindowManager: ObservableObject {
                 appName: window.appName,
                 pid: window.pid,
                 tabTitle: window.title,
-                tabIndex: window.duplicateIndex
+                tabIndex: window.tabIndex
             )
             print("[Winby] focusWindow: AppleScript result = \(tabSwitchHandled)")
 
@@ -1574,7 +1695,7 @@ class WindowManager: ObservableObject {
                 if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
                    let axWindows = windowsRef as? [AXUIElement] {
                     for axWindow in axWindows {
-                        if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.duplicateIndex) {
+                        if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.tabIndex) {
                             tabSwitchHandled = true
                             break
                         }
@@ -2058,14 +2179,18 @@ struct SidebarView: View {
 
     func loadThumbnails() {
         Task {
-            // Start with existing thumbnails to preserve cached ones
             var newThumbnails = thumbnails
             for window in manager.windows {
-                if let thumb = await manager.thumbnail(for: window.windowID) {
-                    newThumbnails[window.windowID] = thumb
+                // For visible windows (not background tabs), always refresh
+                // For background tabs, only fetch if we don't have one
+                let isBackgroundTab = window.parentWindowID != nil
+                if !isBackgroundTab || newThumbnails[window.windowID] == nil {
+                    if let thumb = await manager.thumbnail(for: window.windowID) {
+                        newThumbnails[window.windowID] = thumb
+                    }
                 }
             }
-            // Remove thumbnails for windows that no longer exist
+            // Keep thumbnails for current windows
             let currentIDs = Set(manager.windows.map { $0.windowID })
             newThumbnails = newThumbnails.filter { currentIDs.contains($0.key) }
 
