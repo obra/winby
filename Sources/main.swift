@@ -1248,14 +1248,10 @@ class WindowManager: ObservableObject {
     }
 
     func thumbnail(for windowID: UInt32, maxSize: CGSize = CGSize(width: 200, height: 150)) async -> NSImage? {
-        // Return cached if available
-        if let cached = thumbnailCache[windowID] {
-            return cached
-        }
-
         // Get window info
         guard let window = windows.first(where: { $0.windowID == windowID }) else {
-            return nil
+            // Return cached if window no longer exists
+            return thumbnailCache[windowID]
         }
 
         // For background tabs, check tab screenshot cache first
@@ -1269,7 +1265,7 @@ class WindowManager: ObservableObject {
                let icon = app.icon {
                 return icon
             }
-            return nil
+            return thumbnailCache[windowID]
         }
 
         // Try ScreenCaptureKit for visible windows
@@ -1329,6 +1325,58 @@ class WindowManager: ObservableObject {
 
         // Also ensure the app is activated and window gets keyboard focus
         bringAppToFront(pid: window.pid)
+    }
+
+    /// Toggle fullscreen for a window using Accessibility API
+    func toggleFullscreen(_ windowID: UInt32) {
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            debugLog("Fullscreen: Window \(windowID) not found")
+            return
+        }
+
+        debugLog("Toggling fullscreen for window \(windowID) '\(window.title)'")
+
+        let appElement = AXUIElementCreateApplication(window.pid)
+
+        // Get windows
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement] else {
+            debugLog("Fullscreen: Could not get AX windows")
+            return
+        }
+
+        // Find the window by matching title or just use first window
+        var targetWindow: AXUIElement?
+        for axWindow in axWindows {
+            var titleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef) == .success,
+               let title = titleRef as? String,
+               title == window.title {
+                targetWindow = axWindow
+                break
+            }
+        }
+
+        // Fall back to first window if no match
+        if targetWindow == nil {
+            targetWindow = axWindows.first
+        }
+
+        guard let axWindow = targetWindow else {
+            debugLog("Fullscreen: No target window found")
+            return
+        }
+
+        // Get the fullscreen button and press it
+        var buttonRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axWindow, kAXFullScreenButtonAttribute as CFString, &buttonRef) == .success,
+           let button = buttonRef as! AXUIElement? {
+            let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
+            debugLog("Fullscreen button press result: \(result == .success ? "success" : "failed")")
+        } else {
+            debugLog("Fullscreen: Could not get fullscreen button")
+        }
     }
 
     /// Direct AX-based tab switching - clicks tab radio buttons directly via Accessibility API
@@ -2335,11 +2383,13 @@ struct SidebarView: View {
     @FocusState private var isSearchFocused: Bool
 
     var filteredWindows: [WindowInfo] {
-        if searchText.isEmpty {
+        // Trim spaces - they're used as term separators, not search characters
+        let trimmedSearch = searchText.trimmingCharacters(in: .whitespaces)
+        if trimmedSearch.isEmpty {
             return manager.windows
         }
         // Fuzzy match and sort by score (including content matches)
-        let query = searchText.lowercased()
+        let query = trimmedSearch.lowercased()
         let scored = manager.windows.compactMap { window -> (WindowInfo, Int)? in
             let titleScore = fuzzyMatch(query: query, in: window.displayTitle.lowercased())
             let appScore = fuzzyMatch(query: query, in: window.appName.lowercased())
@@ -2363,8 +2413,11 @@ struct SidebarView: View {
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
 
+            let trimmedSearch = searchText.trimmingCharacters(in: .whitespaces)
+            guard !trimmedSearch.isEmpty else { return }
+
             await MainActor.run { isSearchingContent = true }
-            await manager.searchContent(query: searchText)
+            await manager.searchContent(query: trimmedSearch)
             await MainActor.run { isSearchingContent = false }
         }
     }
@@ -2806,6 +2859,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Temporarily set when raising windows to prevent auto-hide
     var isRaisingWindow = false
 
+    // Local event monitor for catching hotkey when app has focus
+    private var localEventMonitor: Any?
+
     // Onboarding window for first-run experience
     var onboardingWindow: NSWindow?
 
@@ -2813,7 +2869,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create floating panel window (always needed)
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 280, height: 600),
-            styleMask: [.nonactivatingPanel, .titled, .closable, .fullSizeContentView, .hudWindow],
+            styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView, .hudWindow],
             backing: .buffered,
             defer: false
         )
@@ -2942,17 +2998,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let previewPanel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: previewWidth, height: previewHeight),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.titled, .resizable, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         previewWindow = previewPanel
 
+        previewPanel.title = ""
+        previewPanel.titleVisibility = .hidden
+        previewPanel.titlebarAppearsTransparent = true
+        previewPanel.isMovableByWindowBackground = true
         previewPanel.isOpaque = false
         previewPanel.backgroundColor = .clear
         previewPanel.hasShadow = true
         previewPanel.level = .popUpMenu
         previewPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        previewPanel.minSize = NSSize(width: 200, height: 150)
+
+        // Persist window position/size across restarts
+        previewPanel.setFrameAutosaveName("WinbyPreviewWindow")
 
         // Add visual effect background
         let visualEffect = NSVisualEffectView()
@@ -2976,13 +3040,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         previewPanel.contentView = visualEffect
 
-        // Center the preview panel (accounting for sidebar on left)
-        let centerX = screenFrame.origin.x + sidebarWidth + (screenFrame.width - sidebarWidth - previewWidth) / 2
-        let centerY = screenFrame.origin.y + (screenFrame.height - previewHeight) / 2
-        previewPanel.setFrame(
-            NSRect(x: centerX, y: centerY, width: previewWidth, height: previewHeight),
-            display: true
-        )
+        // Only set default position if no saved frame exists
+        if !previewPanel.setFrameUsingName("WinbyPreviewWindow") {
+            // Center the preview panel (accounting for sidebar on left)
+            let centerX = screenFrame.origin.x + sidebarWidth + (screenFrame.width - sidebarWidth - previewWidth) / 2
+            let centerY = screenFrame.origin.y + (screenFrame.height - previewHeight) / 2
+            previewPanel.setFrame(
+                NSRect(x: centerX, y: centerY, width: previewWidth, height: previewHeight),
+                display: true
+            )
+        }
 
         previewPanel.orderOut(nil)
     }
@@ -3314,6 +3381,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
             debugLog("CGEventTap installed successfully for Cmd+Tab")
+        }
+
+        // 4. Set up local event monitor to catch hotkey when app has focus
+        // This handles the case where the global monitor doesn't fire because the app is active
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
+
+            // Only intercept when sidebar is visible
+            guard self.window.isVisible else { return event }
+
+            let eventModifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                .subtracting([.capsLock, .numericPad, .function])
+
+            // Check for Cmd+Enter to fullscreen selected window
+            if event.keyCode == 36 && eventModifiers == .command {  // 36 = Return key
+                if let windowID = WindowManager.shared.selectedWindowID {
+                    WindowManager.shared.bringToFront(windowID)
+                    WindowManager.shared.toggleFullscreen(windowID)
+                    self.hideSidebar()
+                    return nil  // Consume the event
+                }
+            }
+
+            // Check if this matches the configured hotkey
+            if let shortcut = KeyboardShortcuts.getShortcut(for: .toggleWinby) {
+                // Compare key and modifiers
+                if let key = shortcut.key,
+                   event.keyCode == key.rawValue,
+                   eventModifiers == shortcut.modifiers {
+                    // Hotkey pressed while sidebar visible - hide it
+                    self.hideSidebar()
+                    return nil  // Consume the event
+                }
+            }
+
+            return event
         }
     }
 
