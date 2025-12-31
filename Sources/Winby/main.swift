@@ -141,6 +141,34 @@ func _SLPSSetFrontProcessWithOptions(_ psn: UnsafeMutablePointer<ProcessSerialNu
 @_silgen_name("SLPSPostEventRecordTo") @discardableResult
 func SLPSPostEventRecordTo(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ bytes: UnsafeMutablePointer<UInt8>) -> CGError
 
+/// Make a window the key window (from AltTab/Hammerspoon)
+/// This sends special events to the WindowServer to ensure proper focus
+func makeKeyWindow(_ psn: inout ProcessSerialNumber, _ windowID: CGWindowID) {
+    var bytes = [UInt8](repeating: 0, count: 0xf8)
+    bytes[0x04] = 0xf8
+    bytes[0x08] = 0x01
+    bytes[0x3a] = 0x10
+
+    // Fill bytes 0x20-0x2f with 0xff
+    for i in 0x20...0x2f {
+        bytes[i] = 0xff
+    }
+
+    // Copy windowID into bytes at offset 0x3c
+    var wid = windowID
+    withUnsafeBytes(of: &wid) { widBytes in
+        for i in 0..<4 {
+            bytes[0x3c + i] = widBytes[i]
+        }
+    }
+
+    SLPSPostEventRecordTo(&psn, &bytes)
+
+    // Second call with 0x02
+    bytes[0x08] = 0x02
+    SLPSPostEventRecordTo(&psn, &bytes)
+}
+
 /// Get process serial number from PID
 @_silgen_name("GetProcessForPID") @discardableResult
 func GetProcessForPID(_ pid: pid_t, _ psn: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
@@ -148,6 +176,39 @@ func GetProcessForPID(_ pid: pid_t, _ psn: UnsafeMutablePointer<ProcessSerialNum
 // Private API to get CGWindowID from AXUIElement
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<UInt32>) -> AXError
+
+// Private API to create AXUIElement from a remote token (for brute-forcing elements on other spaces)
+// Token format: pid (4 bytes) + 0 (4 bytes) + 0x636f636f (4 bytes) + elementID (8 bytes) = 20 bytes
+@_silgen_name("_AXUIElementCreateWithRemoteToken") @discardableResult
+func _AXUIElementCreateWithRemoteToken(_ data: CFData) -> Unmanaged<AXUIElement>?
+
+/// Brute-force find AXUIElement for a window ID on any space
+/// This is alt-tab's approach for getting AXUIElements for windows on other spaces
+/// that the normal AX APIs can't see
+func findAXUIElement(forWindowID targetWindowID: UInt32, pid: pid_t) -> AXUIElement? {
+    // Token format: pid (4 bytes) + 0 (4 bytes) + 0x636f636f (4 bytes) + elementID (8 bytes)
+    var remoteToken = Data(count: 20)
+    remoteToken.replaceSubrange(0..<4, with: withUnsafeBytes(of: pid) { Data($0) })
+    remoteToken.replaceSubrange(4..<8, with: withUnsafeBytes(of: Int32(0)) { Data($0) })
+    remoteToken.replaceSubrange(8..<12, with: withUnsafeBytes(of: Int32(0x636f636f)) { Data($0) })
+
+    // Iterate through element IDs (alt-tab uses 0-1000 with 100ms timeout)
+    for elementID: UInt64 in 0..<1000 {
+        remoteToken.replaceSubrange(12..<20, with: withUnsafeBytes(of: elementID) { Data($0) })
+
+        guard let element = _AXUIElementCreateWithRemoteToken(remoteToken as CFData)?.takeRetainedValue() else {
+            continue
+        }
+
+        // Check if this element corresponds to our target window
+        var windowID: UInt32 = 0
+        if _AXUIElementGetWindow(element, &windowID) == .success && windowID == targetWindowID {
+            return element
+        }
+    }
+
+    return nil
+}
 
 // Private API to enable/disable system hotkeys
 @_silgen_name("CGSSetGlobalHotKeyOperatingMode")
@@ -170,6 +231,28 @@ struct CGSWindowCaptureOptions: OptionSet {
 // Match AltTab's exact declaration
 @_silgen_name("CGSHWCaptureWindowList")
 func CGSHWCaptureWindowList(_ cid: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>, _ windowCount: UInt32, _ options: CGSWindowCaptureOptions) -> Unmanaged<CFArray>
+
+// CGS space management
+typealias CGSSpaceID = UInt64
+
+@_silgen_name("CGSCopySpacesForWindows")
+func CGSCopySpacesForWindows(_ cid: CGSConnectionID, _ selector: Int, _ windowIDs: CFArray) -> CFArray
+
+@_silgen_name("CGSManagedDisplayGetCurrentSpace")
+func CGSManagedDisplayGetCurrentSpace(_ cid: CGSConnectionID, _ displayUUID: CFString) -> CGSSpaceID
+
+@_silgen_name("CGSManagedDisplaySetCurrentSpace")
+func CGSManagedDisplaySetCurrentSpace(_ cid: CGSConnectionID, _ displayUUID: CFString, _ spaceID: CGSSpaceID)
+
+// Get the main display UUID string (for space switching)
+func getMainDisplayUUID() -> CFString? {
+    guard let mainDisplay = NSScreen.main,
+          let displayID = mainDisplay.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+          let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else {
+        return nil
+    }
+    return CFUUIDCreateString(nil, uuid)
+}
 
 // MARK: - Async Semaphore
 
@@ -259,31 +342,68 @@ class WindowManager: ObservableObject {
     private var refreshTimer: Timer?
     var isCycling = false  // When true, don't reorder windows during refresh
 
+    /// Lock for thread-safe cache access
+    private let cacheLock = NSLock()
+
     /// Cached thumbnails - kept even when windows go to background
-    var thumbnailCache: [UInt32: NSImage] = [:]
+    private var _thumbnailCache: [UInt32: NSImage] = [:]
+    var thumbnailCache: [UInt32: NSImage] {
+        get { cacheLock.withLock { _thumbnailCache } }
+        set { cacheLock.withLock { _thumbnailCache = newValue } }
+    }
 
     /// Tab screenshot cache - keyed by "pid:title" for background tabs
     /// When a tab is visible, we cache its screenshot here so we can show it when it's backgrounded
-    var tabScreenshotCache: [String: NSImage] = [:]
+    private var _tabScreenshotCache: [String: NSImage] = [:]
+
+    /// Thread-safe tab screenshot cache access
+    func getTabScreenshot(key: String) -> NSImage? {
+        cacheLock.withLock { _tabScreenshotCache[key] }
+    }
+
+    func setTabScreenshot(key: String, image: NSImage) {
+        cacheLock.withLock { _tabScreenshotCache[key] = image }
+    }
 
     /// Tab OCR cache - keyed by "pid:title" for background tabs
     /// When a tab is visible, we cache its OCR text here for search when it's backgrounded
-    var tabOcrCache: [String: String] = [:]
+    private var _tabOcrCache: [String: String] = [:]
+
+    /// Thread-safe tab OCR cache access
+    func getTabOcr(key: String) -> String? {
+        cacheLock.withLock { _tabOcrCache[key] }
+    }
+
+    func setTabOcr(key: String, text: String) {
+        cacheLock.withLock { _tabOcrCache[key] = text }
+    }
 
     /// Helper to generate tab cache key
     /// Includes tabIndex to differentiate tabs with identical titles
-    private func tabCacheKey(pid: pid_t, title: String, tabIndex: Int) -> String {
+    func tabCacheKey(pid: pid_t, title: String, tabIndex: Int) -> String {
         return "\(pid):\(title):\(tabIndex)"
     }
 
     /// Cached window content for search (windowID -> content snippet)
-    var contentCache: [UInt32: String] = [:]
+    private var _contentCache: [UInt32: String] = [:]
+    var contentCache: [UInt32: String] {
+        get { cacheLock.withLock { _contentCache } }
+        set { cacheLock.withLock { _contentCache = newValue } }
+    }
 
     /// Windows we've already tried and failed to get content from (don't retry)
-    var contentFailed: Set<UInt32> = []
+    private var _contentFailed: Set<UInt32> = []
+    var contentFailed: Set<UInt32> {
+        get { cacheLock.withLock { _contentFailed } }
+        set { cacheLock.withLock { _contentFailed = newValue } }
+    }
 
     /// Screenshot hashes for change detection (windowID -> hash)
-    var screenshotHashes: [UInt32: Int] = [:]
+    private var _screenshotHashes: [UInt32: Int] = [:]
+    var screenshotHashes: [UInt32: Int] {
+        get { cacheLock.withLock { _screenshotHashes } }
+        set { cacheLock.withLock { _screenshotHashes = newValue } }
+    }
 
     /// Content search results (windowID -> match score)
     @Published var contentMatches: [UInt32: Int] = [:]
@@ -799,7 +919,7 @@ class WindowManager: ObservableObject {
 
         // For background tabs, check tabOcrCache first
         if window.parentWindowID != nil {
-            if let cached = tabOcrCache[cacheKey] {
+            if let cached = getTabOcr(key: cacheKey) {
                 return cached
             }
             // Background tabs can't be captured - no content available
@@ -852,11 +972,9 @@ class WindowManager: ObservableObject {
         let nsImage = NSImage(cgImage: capturedImage, size: NSSize(width: capturedImage.width, height: capturedImage.height))
         if let text = ocrImage(nsImage) {
             // Update hash for next comparison
-            await MainActor.run {
-                screenshotHashes[windowID] = newHash
-                // Also cache by pid+title for when this becomes a background tab
-                tabOcrCache[cacheKey] = text
-            }
+            screenshotHashes[windowID] = newHash
+            // Also cache by pid+title for when this becomes a background tab
+            setTabOcr(key: cacheKey, text: text)
             return text
         }
         return nil
@@ -1029,6 +1147,7 @@ class WindowManager: ObservableObject {
                 zIndex += 1
             }
         }
+        debugLog("Current space has \(currentSpaceWindowIDs.count) windows (IDs: \(currentSpaceWindowIDs.sorted()))")
 
         // Second: Get ALL windows (including other spaces) for frame info
         var cgWindowInfo: [UInt32: (frame: CGRect, isOnScreen: Bool, title: String, pid: pid_t, appName: String)] = [:]
@@ -1133,6 +1252,11 @@ class WindowManager: ObservableObject {
 
                 // Determine if this window is on the current space
                 let isOnCurrentSpace = currentSpaceWindowIDs.contains(windowID)
+
+                // Debug: track space classification
+                if !isOnCurrentSpace {
+                    debugLog("Window \(windowID) '\(title)' from \(appName) NOT in currentSpaceWindowIDs (AX visible, CG not on-screen)")
+                }
 
                 if tabTitles.isEmpty {
                     // No tabs - just add the window
@@ -1354,16 +1478,19 @@ class WindowManager: ObservableObject {
     }
 
     func thumbnail(for windowID: UInt32, maxSize: CGSize = CGSize(width: 200, height: 150)) async -> NSImage? {
+        debugLog("thumbnail: starting for window \(windowID)")
+
         // Get window info
         guard let window = windows.first(where: { $0.windowID == windowID }) else {
             // Return cached if window no longer exists
+            debugLog("thumbnail: window \(windowID) not found, returning cache")
             return thumbnailCache[windowID]
         }
 
         // For background tabs, check tab screenshot cache first
         if window.parentWindowID != nil {
             let cacheKey = tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
-            if let cached = tabScreenshotCache[cacheKey] {
+            if let cached = getTabScreenshot(key: cacheKey) {
                 return cached
             }
             // Background tabs can't be captured directly - fall back to app icon
@@ -1375,9 +1502,11 @@ class WindowManager: ObservableObject {
         }
 
         // Try ScreenCaptureKit for visible windows
+        debugLog("thumbnail: trying ScreenCaptureKit for window \(windowID)")
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
             if let scWindow = content.windows.first(where: { $0.windowID == windowID }) {
+                debugLog("thumbnail: found scWindow for \(windowID)")
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let config = SCStreamConfiguration()
                 // Capture at higher resolution for quality
@@ -1399,7 +1528,7 @@ class WindowManager: ObservableObject {
                 fullResConfig.showsCursor = false
                 if let fullResImage = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: fullResConfig) {
                     let fullResNsImage = NSImage(cgImage: fullResImage, size: scWindow.frame.size)
-                    tabScreenshotCache[cacheKey] = fullResNsImage
+                    setTabScreenshot(key: cacheKey, image: fullResNsImage)
                 }
 
                 return nsImage
@@ -1961,38 +2090,66 @@ class WindowManager: ObservableObject {
         _SLPSSetFrontProcessWithOptions(&psn, targetWindowID, SLPSMode.allWindows.rawValue)
     }
 
+    /// Switch to the space containing a window
+    func switchToSpaceForWindow(_ windowID: UInt32) -> Bool {
+        let cid = CGSMainConnectionID()
+        guard let displayUUID = getMainDisplayUUID() else {
+            debugLog("switchToSpaceForWindow: failed to get display UUID")
+            return false
+        }
+
+        // Get the space(s) this window belongs to
+        let windowArray = [windowID as CFNumber] as CFArray
+        let spaces = CGSCopySpacesForWindows(cid, 0x7, windowArray) // 0x7 = all spaces
+        guard let spaceIDs = spaces as? [CGSSpaceID], let targetSpace = spaceIDs.first else {
+            debugLog("switchToSpaceForWindow: failed to get space for window \(windowID)")
+            return false
+        }
+
+        // Check if we're already on the target space
+        let currentSpace = CGSManagedDisplayGetCurrentSpace(cid, displayUUID)
+        if currentSpace == targetSpace {
+            debugLog("switchToSpaceForWindow: already on space \(targetSpace)")
+            return true
+        }
+
+        // Switch to the target space
+        debugLog("switchToSpaceForWindow: switching from space \(currentSpace) to \(targetSpace)")
+        CGSManagedDisplaySetCurrentSpace(cid, displayUUID, targetSpace)
+        return true
+    }
+
     /// Fully focus a window (used when committing selection)
+    /// Uses alt-tab's approach: SLPSSetFrontProcessWithOptions + makeKeyWindow + AXRaise
+    /// The userGenerated mode triggers automatic space switching
     func focusWindow(_ windowID: UInt32) {
         guard let window = windows.first(where: { $0.windowID == windowID }) else {
             debugLog("focusWindow: window \(windowID) not found")
             return
         }
 
-        print("[Winby] focusWindow: \(window.appName) '\(window.title)' parentWindowID=\(window.parentWindowID?.description ?? "nil")")
+        debugLog("focusWindow: \(window.appName) '\(window.title)' isOnCurrentSpace=\(window.isOnCurrentSpace) parentWindowID=\(window.parentWindowID?.description ?? "nil")")
 
-        // For background tabs, switch to the tab first
-        var tabSwitchHandled = false
+        let targetWindowID = window.parentWindowID ?? windowID
+
+        // Handle background tabs first - switch to the correct tab
         if window.parentWindowID != nil {
-            print("[Winby] focusWindow: this is a background tab, trying to switch")
+            debugLog("focusWindow: this is a background tab, trying to switch")
             // Try AppleScript first (more reliable for Terminal, Safari, etc.)
-            tabSwitchHandled = selectTabViaAppleScript(
+            if !selectTabViaAppleScript(
                 appName: window.appName,
                 pid: window.pid,
                 tabTitle: window.title,
                 tabIndex: window.tabIndex
-            )
-            print("[Winby] focusWindow: AppleScript result = \(tabSwitchHandled)")
-
-            // Fall back to AX approach if AppleScript didn't work
-            if !tabSwitchHandled {
-                print("[Winby] focusWindow: trying AX fallback")
+            ) {
+                // Fall back to AX approach if AppleScript didn't work
+                debugLog("focusWindow: AppleScript failed, trying AX fallback")
                 let appElement = AXUIElementCreateApplication(window.pid)
                 var windowsRef: CFTypeRef?
                 if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
                    let axWindows = windowsRef as? [AXUIElement] {
                     for axWindow in axWindows {
                         if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.tabIndex) {
-                            tabSwitchHandled = true
                             break
                         }
                     }
@@ -2000,31 +2157,60 @@ class WindowManager: ObservableObject {
             }
         }
 
-        // If tab switch was handled by AppleScript/AX, just activate the app
-        // Otherwise use AXRaise + activate pattern (like Switch app does)
-        if tabSwitchHandled {
-            // AppleScript/AX already switched the tab - just bring app to front
-            bringAppToFront(pid: window.pid)
-        } else {
-            // Raise the specific window via AX, then activate the app
-            let appElement = AXUIElementCreateApplication(window.pid)
-            var windowsRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-               let axWindows = windowsRef as? [AXUIElement] {
-                // Find the window with matching ID and raise it
-                for axWindow in axWindows {
-                    var windowIDRef: UInt32 = 0
-                    if _AXUIElementGetWindow(axWindow, &windowIDRef) == .success,
-                       windowIDRef == windowID {
-                        AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-                        break
-                    }
+        // Use alt-tab's proven focus sequence:
+        // 1. SLPSSetFrontProcessWithOptions with userGenerated mode
+        //    - This brings the process to front AND triggers space switch if needed
+        // 2. makeKeyWindow via SLPSPostEventRecordTo
+        //    - Ensures the specific window becomes key
+        // 3. AXRaise to ensure proper z-order
+
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(window.pid, &psn)
+
+        debugLog("focusWindow: calling _SLPSSetFrontProcessWithOptions with userGenerated mode")
+        _SLPSSetFrontProcessWithOptions(&psn, targetWindowID, SLPSMode.userGenerated.rawValue)
+
+        debugLog("focusWindow: calling makeKeyWindow")
+        makeKeyWindow(&psn, targetWindowID)
+
+        // Raise via AX API - need to find the AXUIElement for this window
+        // For windows on other spaces, the normal AX API won't return them,
+        // so we use alt-tab's brute-force approach with _AXUIElementCreateWithRemoteToken
+        var targetAxElement: AXUIElement? = nil
+
+        // First try the normal approach (faster, works for current-space windows)
+        let appElement = AXUIElementCreateApplication(window.pid)
+        var windowsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let axWindows = windowsRef as? [AXUIElement] {
+            for axWindow in axWindows {
+                var windowIDRef: UInt32 = 0
+                if _AXUIElementGetWindow(axWindow, &windowIDRef) == .success,
+                   windowIDRef == targetWindowID {
+                    targetAxElement = axWindow
+                    debugLog("focusWindow: found AXUIElement via normal API")
+                    break
                 }
             }
-            // Activate the app to update menu bar
-            if let app = NSRunningApplication(processIdentifier: window.pid) {
-                app.activate()
+        }
+
+        // If not found, use brute-force approach for other-space windows
+        if targetAxElement == nil && !window.isOnCurrentSpace {
+            debugLog("focusWindow: window not on current space, using brute-force AXUIElement discovery")
+            targetAxElement = findAXUIElement(forWindowID: targetWindowID, pid: window.pid)
+            if targetAxElement != nil {
+                debugLog("focusWindow: found AXUIElement via brute-force")
+            } else {
+                debugLog("focusWindow: brute-force failed to find AXUIElement")
             }
+        }
+
+        // Perform AXRaise
+        if let axElement = targetAxElement {
+            debugLog("focusWindow: performing AXRaise")
+            AXUIElementPerformAction(axElement, kAXRaiseAction as CFString)
+        } else {
+            debugLog("focusWindow: no AXUIElement found, skipping AXRaise")
         }
     }
 }
@@ -2900,16 +3086,47 @@ struct SidebarView: View {
     func loadThumbnails() {
         Task {
             var newThumbnails = thumbnails
-            for window in manager.windows {
-                // For visible windows (not background tabs), always refresh
-                // For background tabs, only fetch if we don't have one
-                let isBackgroundTab = window.parentWindowID != nil
-                if !isBackgroundTab || newThumbnails[window.windowID] == nil {
-                    if let thumb = await manager.thumbnail(for: window.windowID) {
-                        newThumbnails[window.windowID] = thumb
+
+            // Get all SC windows ONCE (expensive call)
+            let scWindows: [SCWindow]
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                scWindows = content.windows
+                debugLog("loadThumbnails: got \(scWindows.count) SCWindows")
+            } catch {
+                debugLog("loadThumbnails: SCShareableContent failed: \(error)")
+                scWindows = []
+            }
+
+            // Build lookup map
+            let scWindowMap = Dictionary(uniqueKeysWithValues: scWindows.map { ($0.windowID, $0) })
+
+            // Process windows in parallel with limited concurrency
+            await withTaskGroup(of: (UInt32, NSImage?).self) { group in
+                for window in manager.windows {
+                    let isBackgroundTab = window.parentWindowID != nil
+                    // Skip if we already have a thumbnail for background tabs
+                    if isBackgroundTab && newThumbnails[window.windowID] != nil {
+                        continue
+                    }
+
+                    group.addTask {
+                        let thumb = await self.captureThumbnail(
+                            window: window,
+                            scWindow: scWindowMap[window.windowID],
+                            maxSize: CGSize(width: 200, height: 150)
+                        )
+                        return (window.windowID, thumb)
+                    }
+                }
+
+                for await (windowID, thumb) in group {
+                    if let thumb = thumb {
+                        newThumbnails[windowID] = thumb
                     }
                 }
             }
+
             // Keep thumbnails for current windows
             let currentIDs = Set(manager.windows.map { $0.windowID })
             newThumbnails = newThumbnails.filter { currentIDs.contains($0.key) }
@@ -2918,6 +3135,63 @@ struct SidebarView: View {
                 thumbnails = newThumbnails
             }
         }
+    }
+
+    /// Capture a single thumbnail using provided SCWindow (avoids repeated SCShareableContent calls)
+    func captureThumbnail(window: WindowInfo, scWindow: SCWindow?, maxSize: CGSize) async -> NSImage? {
+        // For background tabs, check tab screenshot cache first
+        if window.parentWindowID != nil {
+            let cacheKey = manager.tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
+            if let cached = manager.getTabScreenshot(key: cacheKey) {
+                return cached
+            }
+            // Background tabs can't be captured directly - fall back to app icon
+            if let app = NSRunningApplication(processIdentifier: window.pid),
+               let icon = app.icon {
+                return icon
+            }
+            return nil
+        }
+
+        // Try ScreenCaptureKit if we have an SCWindow
+        if let scWindow = scWindow {
+            do {
+                let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+                let config = SCStreamConfiguration()
+                config.width = Int(maxSize.width * 2)
+                config.height = Int(maxSize.height * 2)
+                config.scalesToFit = true
+                config.showsCursor = false
+
+                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                return NSImage(cgImage: image, size: maxSize)
+            } catch {
+                // Fall through to private API
+            }
+        }
+
+        // Fallback: try private API
+        if let cgImage = manager.captureWindowViaPrivateAPI(windowID: window.windowID, fullSize: false) {
+            let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+            let nsImage = NSImage(cgImage: cgImage, size: size)
+
+            let scale = min(maxSize.width / size.width, maxSize.height / size.height)
+            let scaledSize = CGSize(width: size.width * scale, height: size.height * scale)
+            let scaledImage = NSImage(size: scaledSize)
+            scaledImage.lockFocus()
+            nsImage.draw(in: NSRect(origin: .zero, size: scaledSize))
+            scaledImage.unlockFocus()
+
+            return scaledImage
+        }
+
+        // Final fallback: app icon
+        if let app = NSRunningApplication(processIdentifier: window.pid),
+           let icon = app.icon {
+            return icon
+        }
+
+        return nil
     }
 }
 

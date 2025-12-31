@@ -12,5 +12,6 @@ xcuserdata/
 # macOS
 .DS_Store
 
-# Compiled binary
-Winby
+# Compiled binary (only at root level)
+/Winby
+.research/
