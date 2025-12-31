@@ -2504,8 +2504,9 @@ struct SidebarView: View {
         if let windowID = windowID {
             manager.bringToFront(windowID)
             searchText = ""
-            // Hide sidebar after selecting a window
+            // Mark that we selected a window (so focus isn't restored to previous app)
             if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.didSelectWindow = true
                 appDelegate.hideSidebar()
             }
         }
@@ -2610,8 +2611,9 @@ struct SidebarView: View {
                                     manager.selectedWindowID = window.windowID
                                     manager.bringToFront(window.windowID)
                                     searchText = ""
-                                    // Hide sidebar after selecting a window
+                                    // Mark selection and hide sidebar
                                     if let appDelegate = NSApp.delegate as? AppDelegate {
+                                        appDelegate.didSelectWindow = true
                                         appDelegate.hideSidebar()
                                     }
                                 }
@@ -2862,6 +2864,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Local event monitor for catching hotkey when app has focus
     private var localEventMonitor: Any?
 
+    // Track the previously focused app to restore on dismiss without selection
+    private var previouslyFocusedApp: NSRunningApplication?
+    // Track if a window was selected (to know whether to restore focus)
+    var didSelectWindow = false
+
     // Onboarding window for first-run experience
     var onboardingWindow: NSWindow?
 
@@ -2869,7 +2876,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create floating panel window (always needed)
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 280, height: 600),
-            styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView, .hudWindow],
+            styleMask: [.titled, .fullSizeContentView, .hudWindow],
             backing: .buffered,
             defer: false
         )
@@ -2882,6 +2889,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.becomesKeyOnlyIfNeeded = false
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
+
+        // Prevent focus loss to other windows when sidebar is visible
+        NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: panel, queue: .main) { [weak self] _ in
+            guard let self = self, self.window.isVisible else { return }
+            // Immediately reclaim focus if sidebar loses it while visible
+            DispatchQueue.main.async {
+                if self.window.isVisible && !self.window.isKeyWindow {
+                    self.window.makeKey()
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+        }
 
         // Add visual effect background for translucency
         let visualEffect = NSVisualEffectView()
@@ -3155,6 +3174,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let screen = NSScreen.main else { return }
         let screenFrame = screen.visibleFrame
 
+        // Save the currently focused app to restore if dismissed without selection
+        previouslyFocusedApp = NSWorkspace.shared.frontmostApplication
+        didSelectWindow = false
+
         // Disable system hotkeys (like Cmd+Tab) while our switcher is active
         _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 1)  // 1 = disable
 
@@ -3199,6 +3222,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Re-enable system hotkeys
         _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 0)  // 0 = enable
+
+        // Restore focus to previous app if no window was selected
+        if !didSelectWindow, let previousApp = previouslyFocusedApp {
+            previousApp.activate(options: [])
+        }
+        previouslyFocusedApp = nil
 
         // Reset sidebar state
         WindowManager.shared.sidebarResetTrigger.toggle()
@@ -3399,6 +3428,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if let windowID = WindowManager.shared.selectedWindowID {
                     WindowManager.shared.bringToFront(windowID)
                     WindowManager.shared.toggleFullscreen(windowID)
+                    self.didSelectWindow = true
                     self.hideSidebar()
                     return nil  // Consume the event
                 }
@@ -3560,6 +3590,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let manager = WindowManager.shared
         if let windowID = manager.selectedWindowID {
             manager.bringToFront(windowID)
+            didSelectWindow = true
         }
         hideSidebar()
     }
