@@ -36,9 +36,36 @@ class AppConfig: ObservableObject {
         }
     }
 
+    @Published var hasCompletedOnboarding: Bool {
+        didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
+    }
+
     init() {
         self.debugMode = UserDefaults.standard.bool(forKey: "debugMode")
         self.launchAtLogin = SMAppService.mainApp.status == .enabled
+        self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
+    }
+
+    // MARK: - Permission Helpers
+
+    var hasAccessibilityPermission: Bool {
+        AXIsProcessTrusted()
+    }
+
+    var hasScreenRecordingPermission: Bool {
+        CGPreflightScreenCaptureAccess()
+    }
+
+    func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @MainActor
@@ -1929,6 +1956,373 @@ struct SettingsView: View {
     }
 }
 
+// MARK: - Onboarding View
+
+enum OnboardingStep: Int, CaseIterable {
+    case welcome = 0
+    case accessibility
+    case screenRecording
+    case hotkey
+    case launchAtLogin
+    case ready
+}
+
+struct OnboardingView: View {
+    @ObservedObject var config = AppConfig.shared
+    @State private var currentStep: OnboardingStep = .welcome
+    @State private var permissionCheckTimer: Timer?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Content area
+            ZStack {
+                ForEach(OnboardingStep.allCases, id: \.rawValue) { step in
+                    if step == currentStep {
+                        stepContent(for: step)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .trailing).combined(with: .opacity),
+                                removal: .move(edge: .leading).combined(with: .opacity)
+                            ))
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .animation(.easeInOut(duration: 0.3), value: currentStep)
+
+            Spacer()
+
+            // Progress dots
+            HStack(spacing: 8) {
+                ForEach(OnboardingStep.allCases, id: \.rawValue) { step in
+                    Circle()
+                        .fill(step.rawValue <= currentStep.rawValue ? Color.accentColor : Color.gray.opacity(0.3))
+                        .frame(width: 8, height: 8)
+                }
+            }
+            .padding(.bottom, 24)
+        }
+        .frame(width: 480, height: 520)
+        .onAppear {
+            startPermissionPolling()
+        }
+        .onDisappear {
+            permissionCheckTimer?.invalidate()
+        }
+    }
+
+    @ViewBuilder
+    func stepContent(for step: OnboardingStep) -> some View {
+        switch step {
+        case .welcome:
+            welcomeStep
+        case .accessibility:
+            accessibilityStep
+        case .screenRecording:
+            screenRecordingStep
+        case .hotkey:
+            hotkeyStep
+        case .launchAtLogin:
+            launchAtLoginStep
+        case .ready:
+            readyStep
+        }
+    }
+
+    // MARK: - Step Views
+
+    var welcomeStep: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            Image(systemName: "square.grid.2x2")
+                .font(.system(size: 72))
+                .foregroundColor(.accentColor)
+
+            Text("Welcome to Winby")
+                .font(.largeTitle)
+                .fontWeight(.bold)
+
+            Text("A faster way to switch windows — with search, previews, and content search.")
+                .font(.title3)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 340)
+
+            Spacer()
+
+            Button(action: { currentStep = .accessibility }) {
+                Text("Get Started")
+                    .frame(width: 200)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            Spacer().frame(height: 40)
+        }
+        .padding(40)
+    }
+
+    var accessibilityStep: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            ZStack {
+                Image(systemName: "accessibility")
+                    .font(.system(size: 64))
+                    .foregroundColor(.accentColor)
+
+                if config.hasAccessibilityPermission {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 28))
+                        .foregroundColor(.green)
+                        .offset(x: 36, y: 28)
+                }
+            }
+
+            Text("Accessibility Access")
+                .font(.title)
+                .fontWeight(.bold)
+
+            Text("Winby needs Accessibility access to manage windows and respond to your keyboard shortcut.")
+                .font(.body)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 340)
+
+            Spacer()
+
+            if config.hasAccessibilityPermission {
+                Button(action: { currentStep = .screenRecording }) {
+                    Text("Continue")
+                        .frame(width: 200)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            } else {
+                Button(action: { config.openAccessibilitySettings() }) {
+                    Text("Open System Settings")
+                        .frame(width: 200)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Text("Grant access, then return here")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer().frame(height: 40)
+        }
+        .padding(40)
+    }
+
+    var screenRecordingStep: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            ZStack {
+                Image(systemName: "camera.metering.spot")
+                    .font(.system(size: 64))
+                    .foregroundColor(.accentColor)
+
+                if config.hasScreenRecordingPermission {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 28))
+                        .foregroundColor(.green)
+                        .offset(x: 36, y: 28)
+                }
+            }
+
+            Text("Screen Recording")
+                .font(.title)
+                .fontWeight(.bold)
+
+            Text("Screen Recording lets Winby search by what's visible in your windows.")
+                .font(.body)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 340)
+
+            Spacer()
+
+            if config.hasScreenRecordingPermission {
+                Button(action: { currentStep = .hotkey }) {
+                    Text("Continue")
+                        .frame(width: 200)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            } else {
+                Button(action: { config.openScreenRecordingSettings() }) {
+                    Text("Open System Settings")
+                        .frame(width: 200)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Text("Grant access, then return here")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            HStack {
+                Button(action: { currentStep = .accessibility }) {
+                    Text("Back")
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+            }
+
+            Spacer().frame(height: 40)
+        }
+        .padding(40)
+    }
+
+    var hotkeyStep: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            Image(systemName: "keyboard")
+                .font(.system(size: 64))
+                .foregroundColor(.accentColor)
+
+            Text("Choose Your Hotkey")
+                .font(.title)
+                .fontWeight(.bold)
+
+            Text("Pick a keyboard shortcut to activate Winby.")
+                .font(.body)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 340)
+
+            KeyboardShortcuts.Recorder("", name: .toggleWinby)
+                .padding(.vertical, 8)
+
+            Text("Tip: You can use Cmd+Tab, but it requires granting Accessibility permission again after setting it.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 300)
+
+            Spacer()
+
+            Button(action: { currentStep = .launchAtLogin }) {
+                Text("Continue")
+                    .frame(width: 200)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            Button(action: { currentStep = .screenRecording }) {
+                Text("Back")
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+
+            Spacer().frame(height: 40)
+        }
+        .padding(40)
+    }
+
+    var launchAtLoginStep: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            Image(systemName: "power")
+                .font(.system(size: 64))
+                .foregroundColor(.accentColor)
+
+            Text("Launch at Login")
+                .font(.title)
+                .fontWeight(.bold)
+
+            Text("Start Winby automatically when you log in.")
+                .font(.body)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 340)
+
+            Toggle("Launch at Login", isOn: $config.launchAtLogin)
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .padding(.vertical, 8)
+
+            Spacer()
+
+            Button(action: { currentStep = .ready }) {
+                Text("Continue")
+                    .frame(width: 200)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            Button(action: { currentStep = .hotkey }) {
+                Text("Back")
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+
+            Spacer().frame(height: 40)
+        }
+        .padding(40)
+    }
+
+    var readyStep: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 72))
+                .foregroundColor(.green)
+
+            Text("You're All Set!")
+                .font(.largeTitle)
+                .fontWeight(.bold)
+
+            Text("Press \(config.hotkeyDescription) to open Winby anytime.")
+                .font(.title3)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 340)
+
+            Spacer()
+
+            Button(action: {
+                config.hasCompletedOnboarding = true
+                if let appDelegate = NSApp.delegate as? AppDelegate {
+                    appDelegate.hideOnboardingWindow()
+                }
+            }) {
+                Text("Start Using Winby")
+                    .frame(width: 200)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            Spacer().frame(height: 40)
+        }
+        .padding(40)
+    }
+
+    // MARK: - Permission Polling
+
+    func startPermissionPolling() {
+        permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            // Auto-advance when permissions are granted
+            if currentStep == .accessibility && config.hasAccessibilityPermission {
+                withAnimation {
+                    currentStep = .screenRecording
+                }
+            } else if currentStep == .screenRecording && config.hasScreenRecordingPermission {
+                withAnimation {
+                    currentStep = .hotkey
+                }
+            }
+        }
+    }
+}
+
 struct SidebarView: View {
     @ObservedObject var manager = WindowManager.shared
     @ObservedObject var config = AppConfig.shared
@@ -2412,30 +2806,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Temporarily set when raising windows to prevent auto-hide
     var isRaisingWindow = false
 
+    // Onboarding window for first-run experience
+    var onboardingWindow: NSWindow?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Setup global hotkey (Cmd+Shift+Space to focus switcher)
-        setupGlobalHotkey()
-        // Request screen capture permission using CoreGraphics API
-        // This should trigger the permission dialog
-        if !CGPreflightScreenCaptureAccess() {
-            debugLog("Requesting screen capture permission...")
-            let granted = CGRequestScreenCaptureAccess()
-            debugLog("Screen capture permission granted: \(granted)")
-        } else {
-            debugLog("Screen capture permission already granted")
-        }
-
-        // Also try ScreenCaptureKit
-        Task {
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                debugLog("ScreenCaptureKit access OK, found \(content.windows.count) windows")
-            } catch {
-                debugLog("ScreenCaptureKit error: \(error)")
-            }
-        }
-
-        // Create floating panel window
+        // Create floating panel window (always needed)
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 280, height: 600),
             styleMask: [.nonactivatingPanel, .titled, .closable, .fullSizeContentView, .hudWindow],
@@ -2511,8 +2886,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Set up main menu with Edit menu for standard shortcuts
         setupMainMenu()
 
-        // Request accessibility permissions
-        requestAccessibilityPermissions()
+        // Check if this is first run - show onboarding if not completed
+        if !AppConfig.shared.hasCompletedOnboarding {
+            showOnboardingWindow()
+        } else {
+            // Already onboarded - set up hotkeys and verify permissions
+            setupGlobalHotkey()
+            requestAccessibilityPermissions()
+
+            // Request screen capture permission if not granted
+            if !CGPreflightScreenCaptureAccess() {
+                debugLog("Requesting screen capture permission...")
+                let granted = CGRequestScreenCaptureAccess()
+                debugLog("Screen capture permission granted: \(granted)")
+            }
+        }
     }
 
     func setupMainMenu() {
@@ -2629,6 +3017,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func showOnboardingWindow() {
+        if onboardingWindow == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 480, height: 520),
+                styleMask: [.titled, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = ""
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.isMovableByWindowBackground = true
+            window.level = .floating
+            window.center()
+
+            // Add visual effect background
+            let visualEffect = NSVisualEffectView()
+            visualEffect.material = .windowBackground
+            visualEffect.state = .active
+            visualEffect.blendingMode = .behindWindow
+
+            let hostingView = NSHostingView(rootView: OnboardingView())
+            hostingView.translatesAutoresizingMaskIntoConstraints = false
+
+            visualEffect.addSubview(hostingView)
+            NSLayoutConstraint.activate([
+                hostingView.topAnchor.constraint(equalTo: visualEffect.topAnchor),
+                hostingView.bottomAnchor.constraint(equalTo: visualEffect.bottomAnchor),
+                hostingView.leadingAnchor.constraint(equalTo: visualEffect.leadingAnchor),
+                hostingView.trailingAnchor.constraint(equalTo: visualEffect.trailingAnchor)
+            ])
+
+            window.contentView = visualEffect
+            onboardingWindow = window
+        }
+        onboardingWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func hideOnboardingWindow() {
+        onboardingWindow?.orderOut(nil)
+        onboardingWindow = nil
+
+        // After onboarding, set up the hotkey and other runtime things
+        setupGlobalHotkey()
     }
 
     @objc func debugDumpContent() {
