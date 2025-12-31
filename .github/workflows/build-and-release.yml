@@ -87,16 +87,17 @@ jobs:
         # Copy executable
         cp .build/arm64-apple-macosx/release/$APP_NAME "$APP_BUNDLE/Contents/MacOS/"
 
-        # Copy Swift package dependency bundles to Resources
+        # Copy Swift package dependency bundles next to executable
+        # SPM's resource_bundle_accessor looks relative to the executable
         ARCH_DIR=".build/arm64-apple-macosx/release"
         if [ -d "$ARCH_DIR" ]; then
           echo "Copying bundles from: $ARCH_DIR"
           find "$ARCH_DIR" -name "*.bundle" -type d | while read bundle; do
             bundle_name=$(basename "$bundle")
             echo "Copying resource bundle: $bundle"
-            cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"
+            cp -R "$bundle" "$APP_BUNDLE/Contents/MacOS/"
             # Fix permissions
-            find "$APP_BUNDLE/Contents/Resources/$bundle_name" -type f -exec chmod 644 {} \;
+            find "$APP_BUNDLE/Contents/MacOS/$bundle_name" -type f -exec chmod 644 {} \;
           done
         fi
 
@@ -176,8 +177,8 @@ jobs:
             "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
         fi
 
-        # Sign dependency bundles in Resources
-        find "$APP_BUNDLE/Contents/Resources" -name "*.bundle" -type d | while read bundle; do
+        # Sign dependency bundles in MacOS
+        find "$APP_BUNDLE/Contents/MacOS" -name "*.bundle" -type d | while read bundle; do
           echo "Signing bundle: $bundle"
           codesign --force --options runtime --sign "$DEVELOPER_ID_NAME" "$bundle"
         done
