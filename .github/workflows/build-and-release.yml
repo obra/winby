@@ -67,6 +67,42 @@ jobs:
 
     - name: Build Swift package
       run: |
+        # First build to generate the resource accessor
+        swift build --configuration release --arch arm64 || true
+
+        # Patch KeyboardShortcuts resource accessor to check Contents/Resources
+        ACCESSOR=".build/arm64-apple-macosx/release/KeyboardShortcuts.build/DerivedSources/resource_bundle_accessor.swift"
+        if [ -f "$ACCESSOR" ]; then
+          echo "Patching KeyboardShortcuts resource accessor..."
+          cat > "$ACCESSOR" << 'SWIFT'
+        import Foundation
+
+        extension Foundation.Bundle {
+            static let module: Bundle = {
+                let bundleName = "KeyboardShortcuts_KeyboardShortcuts.bundle"
+
+                let candidates = [
+                    // Standard app bundle Resources location
+                    Bundle.main.resourceURL?.appendingPathComponent(bundleName),
+                    // App bundle root (for development)
+                    Bundle.main.bundleURL.appendingPathComponent(bundleName),
+                    // Next to executable
+                    Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(bundleName)
+                ]
+
+                for candidate in candidates {
+                    if let path = candidate?.path, let bundle = Bundle(path: path) {
+                        return bundle
+                    }
+                }
+
+                Swift.fatalError("could not load resource bundle: \(bundleName)")
+            }()
+        }
+        SWIFT
+        fi
+
+        # Rebuild with patched accessor
         swift build --configuration release --arch arm64
 
     - name: Create app bundle structure
@@ -87,17 +123,16 @@ jobs:
         # Copy executable
         cp .build/arm64-apple-macosx/release/$APP_NAME "$APP_BUNDLE/Contents/MacOS/"
 
-        # Copy Swift package dependency bundles next to executable
-        # SPM's resource_bundle_accessor looks relative to the executable
+        # Copy Swift package dependency bundles to Resources
         ARCH_DIR=".build/arm64-apple-macosx/release"
         if [ -d "$ARCH_DIR" ]; then
           echo "Copying bundles from: $ARCH_DIR"
           find "$ARCH_DIR" -name "*.bundle" -type d | while read bundle; do
             bundle_name=$(basename "$bundle")
             echo "Copying resource bundle: $bundle"
-            cp -R "$bundle" "$APP_BUNDLE/Contents/MacOS/"
+            cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"
             # Fix permissions
-            find "$APP_BUNDLE/Contents/MacOS/$bundle_name" -type f -exec chmod 644 {} \;
+            find "$APP_BUNDLE/Contents/Resources/$bundle_name" -type f -exec chmod 644 {} \;
           done
         fi
 
@@ -177,8 +212,8 @@ jobs:
             "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
         fi
 
-        # Sign dependency bundles in MacOS
-        find "$APP_BUNDLE/Contents/MacOS" -name "*.bundle" -type d | while read bundle; do
+        # Sign dependency bundles in Resources
+        find "$APP_BUNDLE/Contents/Resources" -name "*.bundle" -type d | while read bundle; do
           echo "Signing bundle: $bundle"
           codesign --force --options runtime --sign "$DEVELOPER_ID_NAME" "$bundle"
         done
