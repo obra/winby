@@ -3485,15 +3485,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Event tap callback runs on main thread, so use assumeIsolated to avoid deadlock
         let (shouldInterceptCmdTab, settingsIsKey): (Bool, Bool)
         if Thread.isMainThread {
-            (shouldInterceptCmdTab, settingsIsKey) = MainActor.assumeIsolated {
-                (AppConfig.shared.isCmdTabShortcut, self.settingsWindow?.isKeyWindow ?? false)
+            shouldInterceptCmdTab = MainActor.assumeIsolated {
+                AppConfig.shared.isCmdTabShortcut
             }
+            settingsIsKey = settingsWindow?.isKeyWindow ?? false
         } else {
-            (shouldInterceptCmdTab, settingsIsKey) = DispatchQueue.main.sync {
+            shouldInterceptCmdTab = DispatchQueue.main.sync {
                 MainActor.assumeIsolated {
-                    (AppConfig.shared.isCmdTabShortcut, self.settingsWindow?.isKeyWindow ?? false)
+                    AppConfig.shared.isCmdTabShortcut
                 }
             }
+            settingsIsKey = settingsWindow?.isKeyWindow ?? false
         }
 
         // If settings window is focused, intercept Cmd+Tab but post synthetic event for recorder
