@@ -107,6 +107,9 @@ jobs:
           cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
         fi
 
+        # Fix rpath so executable can find Sparkle in Frameworks
+        install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+
         # Create Info.plist
         cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
         <?xml version="1.0" encoding="UTF-8"?>
