@@ -300,7 +300,6 @@ jobs:
         name: Winby-${{ github.event.inputs.version || github.ref_name }}
         path: |
           Winby-*.dmg
-          Winby.app
           appcast.xml
 
     - name: Create Release
