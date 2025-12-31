@@ -3185,11 +3185,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let screenFrame = screen.visibleFrame
 
         // Save the currently focused app to restore if dismissed without selection
-        // Get it before we activate Winby
-        let frontmost = NSWorkspace.shared.frontmostApplication
-        if frontmost?.bundleIdentifier != "com.winby.app" {
+        // Get the frontmost non-Winby app from workspace
+        let allApps = NSWorkspace.shared.runningApplications
+        let winbyPID = ProcessInfo.processInfo.processIdentifier
+
+        if let frontmost = allApps.first(where: {
+            $0.isActive && $0.processIdentifier != winbyPID
+        }) {
             previouslyFocusedApp = frontmost
-            debugLog("Saved previous app: \(frontmost?.localizedName ?? "unknown")")
+            debugLog("Saved previous app: \(frontmost.localizedName ?? "unknown") (pid: \(frontmost.processIdentifier))")
+        } else {
+            debugLog("Could not find non-Winby frontmost app")
         }
         didSelectWindow = false
 
