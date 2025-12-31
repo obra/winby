@@ -193,6 +193,7 @@ struct WindowInfo: Identifiable, Hashable {
     let title: String
     let frame: CGRect
     let isOnScreen: Bool
+    var isOnCurrentSpace: Bool = true  // False if window is on another space/desktop
     var tabIndex: Int = 0  // 0-based tab position within window (for tab switching)
     var duplicateIndex: Int = 0  // 0-based index for windows with same title in same app
     var isClusteredTab: Bool = false  // True if this is a non-frontmost tab in a cluster
@@ -983,17 +984,32 @@ class WindowManager: ObservableObject {
         // Reset synthetic ID counter for this refresh cycle
         syntheticIDCounter = UInt32.max - 1_000_000
 
-        // Build a map of CGWindowID -> window info from CGWindowList
-        // This gives us frame info, isOnScreen status, and z-order
-        var cgWindowInfo: [UInt32: (frame: CGRect, isOnScreen: Bool, title: String)] = [:]
-        var zOrder: [UInt32: Int] = [:]  // Lower = closer to front
+        // First: Get windows on the CURRENT space only (for accurate z-order and current-space detection)
+        var currentSpaceWindowIDs = Set<UInt32>()
+        var zOrder: [UInt32: Int] = [:]  // Lower = closer to front (from current space query)
         var zIndex = 0
 
         if let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
             for windowDict in windowList {
                 guard let windowID = windowDict[kCGWindowNumber as String] as? UInt32,
+                      let layer = windowDict[kCGWindowLayer as String] as? Int,
+                      layer == 0
+                else { continue }
+                currentSpaceWindowIDs.insert(windowID)
+                zOrder[windowID] = zIndex
+                zIndex += 1
+            }
+        }
+
+        // Second: Get ALL windows (including other spaces) for frame info
+        var cgWindowInfo: [UInt32: (frame: CGRect, isOnScreen: Bool, title: String, pid: pid_t, appName: String)] = [:]
+
+        if let windowList = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for windowDict in windowList {
+                guard let windowID = windowDict[kCGWindowNumber as String] as? UInt32,
                       let boundsDict = windowDict[kCGWindowBounds as String] as? [String: CGFloat],
                       let layer = windowDict[kCGWindowLayer as String] as? Int,
+                      let pid = windowDict[kCGWindowOwnerPID as String] as? pid_t,
                       layer == 0
                 else { continue }
 
@@ -1005,9 +1021,8 @@ class WindowManager: ObservableObject {
                 )
                 let isOnScreen = windowDict[kCGWindowIsOnscreen as String] as? Bool ?? false
                 let title = windowDict[kCGWindowName as String] as? String ?? ""
-                cgWindowInfo[windowID] = (frame, isOnScreen, title)
-                zOrder[windowID] = zIndex
-                zIndex += 1
+                let appName = windowDict[kCGWindowOwnerName as String] as? String ?? "Unknown"
+                cgWindowInfo[windowID] = (frame, isOnScreen, title, pid, appName)
             }
         }
 
@@ -1087,9 +1102,12 @@ class WindowManager: ObservableObject {
                 }
                 let tabTitles = tabInfo.titles
 
+                // Determine if this window is on the current space
+                let isOnCurrentSpace = currentSpaceWindowIDs.contains(windowID)
+
                 if tabTitles.isEmpty {
                     // No tabs - just add the window
-                    newWindows.append(WindowInfo(
+                    var windowInfo = WindowInfo(
                         windowID: windowID,
                         parentWindowID: nil,
                         pid: pid,
@@ -1097,7 +1115,9 @@ class WindowManager: ObservableObject {
                         title: title,
                         frame: frame,
                         isOnScreen: isOnScreen
-                    ))
+                    )
+                    windowInfo.isOnCurrentSpace = isOnCurrentSpace
+                    newWindows.append(windowInfo)
                 } else {
                     // Has tabs - add each tab
                     // Determine which tab is active:
@@ -1145,11 +1165,48 @@ class WindowManager: ObservableObject {
                             frame: frame,
                             isOnScreen: isActiveTab
                         )
+                        windowInfo.isOnCurrentSpace = isOnCurrentSpace
                         windowInfo.tabIndex = index
                         newWindows.append(windowInfo)
                     }
                 }
             }
+        }
+
+        // Track which window IDs we've already added from AX enumeration
+        let axWindowIDs = Set(newWindows.map { $0.windowID })
+
+        // Add windows from OTHER spaces using CG info (AX can't see them)
+        // These are windows in cgWindowInfo but NOT in currentSpaceWindowIDs and NOT already added
+        for (windowID, cgInfo) in cgWindowInfo {
+            // Skip if already added via AX, or if on current space (would have been found by AX)
+            if axWindowIDs.contains(windowID) || currentSpaceWindowIDs.contains(windowID) {
+                continue
+            }
+
+            // Skip windows without titles
+            if cgInfo.title.isEmpty { continue }
+
+            // Skip tiny windows
+            if cgInfo.frame.width < 100 || cgInfo.frame.height < 100 { continue }
+
+            // Skip our own windows
+            if cgInfo.pid == myPID { continue }
+
+            // Skip excluded apps
+            if Self.excludedApps.contains(cgInfo.appName) { continue }
+
+            var windowInfo = WindowInfo(
+                windowID: windowID,
+                parentWindowID: nil,
+                pid: cgInfo.pid,
+                appName: cgInfo.appName,
+                title: cgInfo.title,
+                frame: cgInfo.frame,
+                isOnScreen: cgInfo.isOnScreen
+            )
+            windowInfo.isOnCurrentSpace = false
+            newWindows.append(windowInfo)
         }
 
         // Sort by z-order (front to back), windows not in z-order map go to end
@@ -2405,6 +2462,16 @@ struct SidebarView: View {
         return scored.sorted { $0.1 > $1.1 }.map { $0.0 }
     }
 
+    /// Windows on the current space
+    var currentSpaceWindows: [WindowInfo] {
+        filteredWindows.filter { $0.isOnCurrentSpace }
+    }
+
+    /// Windows on other spaces
+    var otherSpaceWindows: [WindowInfo] {
+        filteredWindows.filter { !$0.isOnCurrentSpace }
+    }
+
     /// Trigger debounced content search
     func triggerContentSearch() {
         contentSearchTask?.cancel()
@@ -2468,7 +2535,8 @@ struct SidebarView: View {
 
     /// Flat list of windows for keyboard navigation (matches visual order)
     var flatWindowList: [WindowInfo] {
-        filteredWindows
+        // Current space windows first, then other spaces
+        currentSpaceWindows + otherSpaceWindows
     }
 
     func selectNext() {
@@ -2601,7 +2669,8 @@ struct SidebarView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(filteredWindows) { window in
+                        // Current space windows
+                        ForEach(currentSpaceWindows) { window in
                             WindowRow(
                                 window: window,
                                 isSelected: manager.selectedWindowID == window.windowID,
@@ -2619,6 +2688,44 @@ struct SidebarView: View {
                                 }
                             )
                             .id(window.id)  // Use String id for SwiftUI identity
+                        }
+
+                        // Other spaces section (if any)
+                        if !otherSpaceWindows.isEmpty {
+                            HStack {
+                                Rectangle()
+                                    .fill(Color.secondary.opacity(0.3))
+                                    .frame(height: 1)
+                                Text("Other Spaces")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                Rectangle()
+                                    .fill(Color.secondary.opacity(0.3))
+                                    .frame(height: 1)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 8)
+
+                            ForEach(otherSpaceWindows) { window in
+                                WindowRow(
+                                    window: window,
+                                    isSelected: manager.selectedWindowID == window.windowID,
+                                    hasContentMatch: manager.contentMatches[window.windowID] != nil,
+                                    thumbnail: thumbnails[window.windowID],
+                                    onSelect: {
+                                        manager.selectedWindowID = window.windowID
+                                        manager.bringToFront(window.windowID)
+                                        searchText = ""
+                                        // Mark selection and hide sidebar
+                                        if let appDelegate = NSApp.delegate as? AppDelegate {
+                                            appDelegate.didSelectWindow = true
+                                            appDelegate.hideSidebar()
+                                        }
+                                    }
+                                )
+                                .id(window.id)
+                                .opacity(0.7)  // Slightly dimmed to indicate different space
+                            }
                         }
                     }
                     .padding(.vertical, 4)
