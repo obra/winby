@@ -87,16 +87,17 @@ jobs:
         # Copy executable
         cp .build/arm64-apple-macosx/release/$APP_NAME "$APP_BUNDLE/Contents/MacOS/"
 
-        # Copy Swift package dependency bundles to Contents/
+        # Copy Swift package dependency bundles
+        # KeyboardShortcuts looks for bundles at app root, so copy there
         ARCH_DIR=".build/arm64-apple-macosx/release"
         if [ -d "$ARCH_DIR" ]; then
           echo "Copying bundles from: $ARCH_DIR"
           find "$ARCH_DIR" -name "*.bundle" -type d | while read bundle; do
             bundle_name=$(basename "$bundle")
-            echo "Copying resource bundle to Contents: $bundle"
-            cp -R "$bundle" "$APP_BUNDLE/Contents/"
+            echo "Copying resource bundle: $bundle"
+            cp -R "$bundle" "$APP_BUNDLE/"
             # Fix permissions
-            find "$APP_BUNDLE/Contents/$bundle_name" -type f -exec chmod 644 {} \;
+            find "$APP_BUNDLE/$bundle_name" -type f -exec chmod 644 {} \;
           done
         fi
 
@@ -176,8 +177,8 @@ jobs:
             "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
         fi
 
-        # Sign dependency bundles
-        find "$APP_BUNDLE/Contents" -name "*.bundle" -type d | while read bundle; do
+        # Sign dependency bundles (at app root for KeyboardShortcuts compatibility)
+        find "$APP_BUNDLE" -maxdepth 1 -name "*.bundle" -type d | while read bundle; do
           echo "Signing bundle: $bundle"
           codesign --force --options runtime --sign "$DEVELOPER_ID_NAME" "$bundle"
         done
