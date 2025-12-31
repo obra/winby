@@ -2895,10 +2895,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self, self.window.isVisible else { return }
             // Immediately reclaim focus if sidebar loses it while visible
             DispatchQueue.main.async {
-                if self.window.isVisible && !self.window.isKeyWindow {
-                    self.window.makeKey()
-                    NSApp.activate(ignoringOtherApps: true)
+                guard self.window.isVisible && !self.window.isKeyWindow else { return }
+
+                let keyWindow = NSApp.keyWindow
+                debugLog("Sidebar resigned key, new key window: \(keyWindow?.title ?? "none")")
+
+                // Don't reclaim if settings has focus (preview is .nonactivatingPanel so won't become key)
+                if keyWindow == self.settingsWindow {
+                    return
                 }
+
+                // Some other window stole focus - reclaim it
+                debugLog("Reclaiming focus for sidebar")
+                self.window.makeKey()
+                NSApp.activate(ignoringOtherApps: true)
             }
         }
 
@@ -3175,7 +3185,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let screenFrame = screen.visibleFrame
 
         // Save the currently focused app to restore if dismissed without selection
-        previouslyFocusedApp = NSWorkspace.shared.frontmostApplication
+        // Get it before we activate Winby
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        if frontmost?.bundleIdentifier != "com.winby.app" {
+            previouslyFocusedApp = frontmost
+            debugLog("Saved previous app: \(frontmost?.localizedName ?? "unknown")")
+        }
         didSelectWindow = false
 
         // Disable system hotkeys (like Cmd+Tab) while our switcher is active
@@ -3225,7 +3240,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Restore focus to previous app if no window was selected
         if !didSelectWindow, let previousApp = previouslyFocusedApp {
-            previousApp.activate(options: [])
+            debugLog("Restoring focus to: \(previousApp.localizedName ?? "unknown") (pid: \(previousApp.processIdentifier))")
+            previousApp.activate()
+
+            // Also try to bring the frontmost window to front using AX
+            let appElement = AXUIElementCreateApplication(previousApp.processIdentifier)
+            var windowsRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+               let windows = windowsRef as? [AXUIElement],
+               let frontWindow = windows.first {
+                AXUIElementPerformAction(frontWindow, kAXRaiseAction as CFString)
+                debugLog("Raised previous app's front window via AX")
+            }
+        } else if !didSelectWindow {
+            debugLog("No previous app to restore focus to")
+        } else {
+            debugLog("Window was selected, not restoring previous focus")
         }
         previouslyFocusedApp = nil
 
