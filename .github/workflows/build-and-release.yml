@@ -74,32 +74,42 @@ jobs:
         ACCESSOR=".build/arm64-apple-macosx/release/KeyboardShortcuts.build/DerivedSources/resource_bundle_accessor.swift"
         if [ -f "$ACCESSOR" ]; then
           echo "Patching KeyboardShortcuts resource accessor..."
-          cat > "$ACCESSOR" << 'SWIFT'
-        import Foundation
+          cat > "$ACCESSOR" << 'EOF'
+import Foundation
 
-        extension Foundation.Bundle {
-            static let module: Bundle = {
-                let bundleName = "KeyboardShortcuts_KeyboardShortcuts.bundle"
+extension Foundation.Bundle {
+    static let module: Bundle = {
+        let bundleName = "KeyboardShortcuts_KeyboardShortcuts.bundle"
 
-                let candidates = [
-                    // Standard app bundle Resources location
-                    Bundle.main.resourceURL?.appendingPathComponent(bundleName),
-                    // App bundle root (for development)
-                    Bundle.main.bundleURL.appendingPathComponent(bundleName),
-                    // Next to executable
-                    Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(bundleName)
-                ]
+        let candidates = [
+            // Standard app bundle Resources location
+            Bundle.main.resourceURL?.appendingPathComponent(bundleName),
+            // App bundle root (for development)
+            Bundle.main.bundleURL.appendingPathComponent(bundleName),
+            // Next to executable
+            Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(bundleName)
+        ]
 
-                for candidate in candidates {
-                    if let path = candidate?.path, let bundle = Bundle(path: path) {
-                        return bundle
-                    }
-                }
-
-                Swift.fatalError("could not load resource bundle: \(bundleName)")
-            }()
+        for candidate in candidates {
+            if let path = candidate?.path, let bundle = Bundle(path: path) {
+                return bundle
+            }
         }
-        SWIFT
+
+        Swift.fatalError("could not load resource bundle: \(bundleName)")
+    }()
+}
+EOF
+          # Force recompilation by removing compiled objects (keep DerivedSources with patch)
+          echo "Removing KeyboardShortcuts compiled artifacts to force recompilation..."
+          rm -rf .build/arm64-apple-macosx/release/KeyboardShortcuts.build/*.o
+          rm -rf .build/arm64-apple-macosx/release/KeyboardShortcuts.build/*.swiftmodule
+          rm -rf .build/arm64-apple-macosx/release/KeyboardShortcuts.build/Objects-normal
+          rm -rf .build/arm64-apple-macosx/release/Modules/KeyboardShortcuts*
+          rm -f .build/arm64-apple-macosx/release/libKeyboardShortcuts.*
+
+          echo "Patched accessor contents:"
+          cat "$ACCESSOR"
         fi
 
         # Rebuild with patched accessor
