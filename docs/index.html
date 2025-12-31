@@ -3,25 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Winby — Fast Window Switching for macOS</title>
-    <meta name="description" content="Switch windows instantly with search, previews, and content search. A keyboard-driven window manager for macOS power users.">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <title>Winby — Window Switching for macOS</title>
+    <meta name="description" content="Switch windows instantly with search, previews, and content search. A keyboard-driven window manager for macOS.">
     <style>
         :root {
-            --bg-primary: #0a0a0a;
-            --bg-secondary: #111111;
-            --bg-card: rgba(255, 255, 255, 0.03);
-            --bg-card-hover: rgba(255, 255, 255, 0.06);
-            --border-subtle: rgba(255, 255, 255, 0.08);
+            --bg: #000000;
+            --bg-secondary: #1d1d1f;
             --text-primary: #f5f5f7;
-            --text-secondary: rgba(255, 255, 255, 0.6);
-            --text-tertiary: rgba(255, 255, 255, 0.4);
-            --accent: #0A84FF;
-            --accent-glow: rgba(10, 132, 255, 0.3);
-            --green: #30D158;
-            --purple: #BF5AF2;
+            --text-secondary: #86868b;
+            --text-tertiary: #6e6e73;
+            --blue: #2997ff;
+            --blue-hover: #0077ed;
+            --border: rgba(255, 255, 255, 0.08);
         }
 
         * {
@@ -32,639 +25,585 @@
 
         html {
             scroll-behavior: smooth;
+            -webkit-font-smoothing: antialiased;
         }
 
         body {
-            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
-            background: var(--bg-primary);
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'Helvetica Neue', sans-serif;
+            background: var(--bg);
             color: var(--text-primary);
-            line-height: 1.6;
-            overflow-x: hidden;
-        }
-
-        /* Subtle grid background */
-        .bg-grid {
-            position: fixed;
-            inset: 0;
-            background-image:
-                linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
-            background-size: 60px 60px;
-            pointer-events: none;
-            z-index: 0;
-        }
-
-        /* Gradient orbs */
-        .gradient-orb {
-            position: fixed;
-            border-radius: 50%;
-            filter: blur(120px);
-            pointer-events: none;
-            z-index: 0;
-        }
-
-        .orb-1 {
-            width: 600px;
-            height: 600px;
-            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
-            top: -200px;
-            right: -100px;
-            opacity: 0.4;
-        }
-
-        .orb-2 {
-            width: 400px;
-            height: 400px;
-            background: radial-gradient(circle, rgba(191, 90, 242, 0.2) 0%, transparent 70%);
-            bottom: 20%;
-            left: -100px;
-            opacity: 0.3;
+            line-height: 1.5;
         }
 
         .container {
-            max-width: 1100px;
+            max-width: 980px;
             margin: 0 auto;
-            padding: 0 24px;
-            position: relative;
-            z-index: 1;
+            padding: 0 22px;
         }
 
-        /* Navigation */
+        /* Navigation - Apple style */
         nav {
             position: fixed;
             top: 0;
             left: 0;
             right: 0;
             z-index: 100;
-            padding: 16px 0;
-            background: rgba(10, 10, 10, 0.8);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border-bottom: 1px solid var(--border-subtle);
+            height: 48px;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: saturate(180%) blur(20px);
+            -webkit-backdrop-filter: saturate(180%) blur(20px);
         }
 
         nav .container {
+            height: 100%;
             display: flex;
             justify-content: space-between;
             align-items: center;
         }
 
-        .logo {
-            display: flex;
-            align-items: center;
-            gap: 10px;
+        .nav-logo {
+            font-size: 21px;
             font-weight: 600;
-            font-size: 1.25rem;
             color: var(--text-primary);
             text-decoration: none;
-        }
-
-        .logo-icon {
-            width: 32px;
-            height: 32px;
-            background: linear-gradient(135deg, var(--accent) 0%, var(--purple) 100%);
-            border-radius: 8px;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            grid-template-rows: 1fr 1fr;
-            gap: 3px;
-            padding: 6px;
-        }
-
-        .logo-icon span {
-            background: rgba(255, 255, 255, 0.9);
-            border-radius: 2px;
+            letter-spacing: -0.01em;
         }
 
         .nav-links {
             display: flex;
             align-items: center;
-            gap: 32px;
+            gap: 28px;
         }
 
         .nav-links a {
+            font-size: 12px;
             color: var(--text-secondary);
             text-decoration: none;
-            font-size: 0.9rem;
-            font-weight: 400;
-            transition: color 0.2s;
+            transition: color 0.3s;
         }
 
         .nav-links a:hover {
             color: var(--text-primary);
         }
 
-        .btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            padding: 10px 20px;
-            border-radius: 8px;
-            font-weight: 500;
-            font-size: 0.9rem;
-            text-decoration: none;
-            transition: all 0.2s;
-            cursor: pointer;
-            border: none;
-        }
-
-        .btn-primary {
-            background: var(--accent);
+        .nav-links .btn-download {
+            background: var(--blue);
             color: white;
+            padding: 8px 16px;
+            border-radius: 980px;
+            font-weight: 500;
         }
 
-        .btn-primary:hover {
-            background: #0977e5;
-            transform: translateY(-1px);
-        }
-
-        .btn-secondary {
-            background: var(--bg-card);
-            color: var(--text-primary);
-            border: 1px solid var(--border-subtle);
-        }
-
-        .btn-secondary:hover {
-            background: var(--bg-card-hover);
-            border-color: rgba(255, 255, 255, 0.15);
+        .nav-links .btn-download:hover {
+            background: var(--blue-hover);
         }
 
         /* Hero */
         .hero {
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
+            padding: 120px 0 60px;
             text-align: center;
-            padding: 120px 24px 80px;
         }
 
-        .hero-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            padding: 6px 14px;
-            background: var(--bg-card);
-            border: 1px solid var(--border-subtle);
-            border-radius: 100px;
-            font-size: 0.85rem;
+        .hero-eyebrow {
+            font-size: 17px;
+            font-weight: 400;
             color: var(--text-secondary);
-            margin-bottom: 32px;
-            animation: fadeInUp 0.6s ease-out;
-        }
-
-        .hero-badge .dot {
-            width: 6px;
-            height: 6px;
-            background: var(--green);
-            border-radius: 50%;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            margin-bottom: 8px;
         }
 
         .hero h1 {
-            font-size: clamp(3rem, 8vw, 5rem);
-            font-weight: 700;
-            line-height: 1.1;
-            margin-bottom: 24px;
-            letter-spacing: -0.03em;
-            animation: fadeInUp 0.6s ease-out 0.1s both;
-        }
-
-        .hero h1 .gradient {
-            background: linear-gradient(135deg, var(--text-primary) 0%, var(--accent) 50%, var(--purple) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            font-size: 56px;
+            font-weight: 600;
+            letter-spacing: -0.015em;
+            line-height: 1.07;
+            margin-bottom: 16px;
         }
 
         .hero-subtitle {
-            font-size: 1.25rem;
+            font-size: 28px;
+            font-weight: 400;
             color: var(--text-secondary);
-            max-width: 540px;
-            margin-bottom: 48px;
-            font-weight: 300;
-            animation: fadeInUp 0.6s ease-out 0.2s both;
+            letter-spacing: 0.004em;
+            line-height: 1.2;
+            max-width: 600px;
+            margin: 0 auto 32px;
         }
 
-        .hero-actions {
+        .hero-cta {
             display: flex;
-            gap: 16px;
-            margin-bottom: 64px;
-            animation: fadeInUp 0.6s ease-out 0.3s both;
-        }
-
-        /* Keyboard shortcut display */
-        .shortcut-display {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 20px 32px;
-            background: var(--bg-card);
-            border: 1px solid var(--border-subtle);
-            border-radius: 16px;
-            animation: fadeInUp 0.6s ease-out 0.4s both;
-        }
-
-        .key {
-            display: flex;
-            align-items: center;
             justify-content: center;
-            min-width: 48px;
-            height: 48px;
-            padding: 0 16px;
-            background: linear-gradient(180deg, #2a2a2a 0%, #1a1a1a 100%);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            font-size: 0.95rem;
-            font-weight: 500;
-            color: var(--text-primary);
+            gap: 24px;
+            margin-bottom: 64px;
+        }
+
+        .hero-cta a {
+            font-size: 17px;
+            color: var(--blue);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .hero-cta a:hover {
+            text-decoration: underline;
+        }
+
+        .hero-cta .arrow {
+            font-size: 20px;
+            transition: transform 0.2s;
+        }
+
+        .hero-cta a:hover .arrow {
+            transform: translateX(3px);
+        }
+
+        /* Screenshot showcase */
+        .screenshot-showcase {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 0 22px;
+        }
+
+        .screenshot-showcase img {
+            width: 100%;
+            height: auto;
+            border-radius: 12px;
             box-shadow:
-                0 4px 8px rgba(0, 0, 0, 0.4),
-                inset 0 1px 0 rgba(255, 255, 255, 0.1);
-            transition: transform 0.15s, box-shadow 0.15s;
+                0 0 0 0.5px rgba(255, 255, 255, 0.1),
+                0 25px 50px -12px rgba(0, 0, 0, 0.8),
+                0 0 80px rgba(0, 0, 0, 0.5);
         }
 
-        .key.active {
-            transform: translateY(2px);
-            box-shadow:
-                0 2px 4px rgba(0, 0, 0, 0.4),
-                inset 0 1px 0 rgba(255, 255, 255, 0.1);
-            background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%);
-        }
-
-        .key-plus {
-            color: var(--text-tertiary);
-            font-size: 1.25rem;
-        }
-
-        @keyframes fadeInUp {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        /* Features */
+        /* Features Section */
         .features {
             padding: 120px 0;
         }
 
-        .section-label {
-            display: inline-block;
-            font-size: 0.8rem;
-            font-weight: 500;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            color: var(--accent);
+        .features-header {
+            text-align: center;
+            margin-bottom: 80px;
+        }
+
+        .features-header h2 {
+            font-size: 48px;
+            font-weight: 600;
+            letter-spacing: -0.01em;
             margin-bottom: 16px;
         }
 
-        .section-title {
-            font-size: clamp(2rem, 5vw, 3rem);
-            font-weight: 700;
-            margin-bottom: 16px;
-            letter-spacing: -0.02em;
-        }
-
-        .section-subtitle {
-            font-size: 1.1rem;
+        .features-header p {
+            font-size: 21px;
             color: var(--text-secondary);
-            max-width: 600px;
-            margin-bottom: 64px;
         }
 
         .features-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-            gap: 24px;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 30px;
         }
 
-        .feature-card {
-            padding: 32px;
-            background: var(--bg-card);
-            border: 1px solid var(--border-subtle);
-            border-radius: 20px;
-            transition: all 0.3s ease;
-        }
-
-        .feature-card:hover {
-            background: var(--bg-card-hover);
-            border-color: rgba(255, 255, 255, 0.12);
-            transform: translateY(-4px);
+        .feature {
+            text-align: center;
+            padding: 20px;
         }
 
         .feature-icon {
-            width: 48px;
-            height: 48px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, var(--accent) 0%, var(--purple) 100%);
-            border-radius: 12px;
+            font-size: 48px;
             margin-bottom: 20px;
-            font-size: 1.5rem;
         }
 
-        .feature-card h3 {
-            font-size: 1.25rem;
+        .feature h3 {
+            font-size: 24px;
             font-weight: 600;
             margin-bottom: 12px;
         }
 
-        .feature-card p {
+        .feature p {
+            font-size: 17px;
             color: var(--text-secondary);
-            font-size: 0.95rem;
-            line-height: 1.7;
+            line-height: 1.5;
         }
 
-        /* How it works */
-        .how-it-works {
-            padding: 120px 0;
-            border-top: 1px solid var(--border-subtle);
+        /* Screenshot Gallery */
+        .gallery {
+            padding: 80px 0;
+            background: var(--bg-secondary);
+        }
+
+        .gallery-header {
+            text-align: center;
+            margin-bottom: 48px;
+        }
+
+        .gallery-header h2 {
+            font-size: 48px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+
+        .gallery-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 24px;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 0 22px;
+        }
+
+        .gallery-item {
+            position: relative;
+            overflow: hidden;
+            border-radius: 12px;
+        }
+
+        .gallery-item img {
+            width: 100%;
+            height: auto;
+            display: block;
+            transition: transform 0.3s;
+        }
+
+        .gallery-item:hover img {
+            transform: scale(1.02);
+        }
+
+        .gallery-caption {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 20px;
+            background: linear-gradient(transparent, rgba(0,0,0,0.8));
+            color: white;
+        }
+
+        .gallery-caption h3 {
+            font-size: 17px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .gallery-caption p {
+            font-size: 14px;
+            color: rgba(255,255,255,0.7);
+        }
+
+        /* How Section */
+        .how {
+            padding: 100px 0;
+        }
+
+        .how-header {
+            text-align: center;
+            margin-bottom: 60px;
+        }
+
+        .how-header h2 {
+            font-size: 48px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+
+        .shortcut-display {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            margin-bottom: 48px;
+        }
+
+        .key {
+            background: linear-gradient(180deg, #3a3a3c 0%, #2c2c2e 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 16px 24px;
+            font-size: 20px;
+            font-weight: 500;
+            box-shadow:
+                0 1px 0 rgba(255, 255, 255, 0.05) inset,
+                0 4px 8px rgba(0, 0, 0, 0.4);
+        }
+
+        .key-plus {
+            font-size: 24px;
+            color: var(--text-tertiary);
+            display: flex;
+            align-items: center;
         }
 
         .steps {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 48px;
-            margin-top: 64px;
-        }
-
-        .step {
+            gap: 40px;
             text-align: center;
         }
 
         .step-number {
-            width: 56px;
-            height: 56px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto 24px;
-            background: var(--bg-card);
-            border: 1px solid var(--border-subtle);
-            border-radius: 50%;
-            font-size: 1.25rem;
+            font-size: 17px;
             font-weight: 600;
-            color: var(--accent);
+            color: var(--blue);
+            margin-bottom: 12px;
         }
 
         .step h3 {
-            font-size: 1.1rem;
+            font-size: 24px;
             font-weight: 600;
             margin-bottom: 12px;
         }
 
         .step p {
+            font-size: 17px;
             color: var(--text-secondary);
-            font-size: 0.9rem;
         }
 
         /* CTA */
         .cta {
             padding: 120px 0;
             text-align: center;
+            background: var(--bg-secondary);
         }
 
-        .cta-box {
-            padding: 80px 40px;
-            background: linear-gradient(135deg, rgba(10, 132, 255, 0.1) 0%, rgba(191, 90, 242, 0.1) 100%);
-            border: 1px solid var(--border-subtle);
-            border-radius: 32px;
-            position: relative;
-            overflow: hidden;
+        .cta h2 {
+            font-size: 48px;
+            font-weight: 600;
+            margin-bottom: 24px;
         }
 
-        .cta-box::before {
-            content: '';
-            position: absolute;
-            inset: 0;
-            background: radial-gradient(ellipse at center, rgba(10, 132, 255, 0.15) 0%, transparent 70%);
-            pointer-events: none;
+        .cta-buttons {
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            margin-bottom: 24px;
         }
 
-        .cta-box h2 {
-            font-size: clamp(2rem, 4vw, 2.5rem);
-            font-weight: 700;
-            margin-bottom: 16px;
-            position: relative;
+        .btn-large {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 16px 32px;
+            border-radius: 980px;
+            font-size: 17px;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.2s;
         }
 
-        .cta-box p {
-            color: var(--text-secondary);
-            margin-bottom: 32px;
-            font-size: 1.1rem;
-            position: relative;
+        .btn-primary {
+            background: var(--blue);
+            color: white;
         }
 
-        .cta-box .btn {
-            position: relative;
+        .btn-primary:hover {
+            background: var(--blue-hover);
         }
 
-        .requirements {
-            margin-top: 24px;
-            font-size: 0.85rem;
+        .btn-outline {
+            background: transparent;
+            color: var(--blue);
+            border: 1px solid var(--blue);
+        }
+
+        .btn-outline:hover {
+            background: var(--blue);
+            color: white;
+        }
+
+        .cta-note {
+            font-size: 14px;
             color: var(--text-tertiary);
-            position: relative;
         }
 
         /* Footer */
         footer {
-            padding: 48px 0;
-            border-top: 1px solid var(--border-subtle);
-            text-align: center;
+            padding: 20px 0;
+            border-top: 1px solid var(--border);
         }
 
-        footer p {
+        footer .container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        footer p, footer a {
+            font-size: 12px;
             color: var(--text-tertiary);
-            font-size: 0.9rem;
         }
 
         footer a {
-            color: var(--text-secondary);
             text-decoration: none;
-            transition: color 0.2s;
         }
 
         footer a:hover {
-            color: var(--text-primary);
+            color: var(--text-secondary);
+        }
+
+        .footer-links {
+            display: flex;
+            gap: 24px;
         }
 
         /* Responsive */
         @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 40px;
+            }
+
+            .hero-subtitle {
+                font-size: 21px;
+            }
+
+            .features-grid,
+            .steps {
+                grid-template-columns: 1fr;
+            }
+
+            .gallery-grid {
+                grid-template-columns: 1fr;
+            }
+
             .nav-links {
                 display: none;
             }
 
-            .hero-actions {
-                flex-direction: column;
-                width: 100%;
-                max-width: 280px;
-            }
-
-            .btn {
-                justify-content: center;
-            }
-
             .shortcut-display {
-                padding: 16px 20px;
+                flex-wrap: wrap;
             }
 
-            .key {
-                min-width: 40px;
-                height: 40px;
-                padding: 0 12px;
-                font-size: 0.85rem;
+            .hero-cta {
+                flex-direction: column;
+                align-items: center;
             }
 
-            .steps {
-                grid-template-columns: 1fr;
-                gap: 40px;
+            .cta-buttons {
+                flex-direction: column;
+                align-items: center;
             }
-
-            .features-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        /* Download icon */
-        .icon-download {
-            width: 16px;
-            height: 16px;
         }
     </style>
 </head>
 <body>
-    <div class="bg-grid"></div>
-    <div class="gradient-orb orb-1"></div>
-    <div class="gradient-orb orb-2"></div>
-
     <nav>
         <div class="container">
-            <a href="#" class="logo">
-                <div class="logo-icon">
-                    <span></span><span></span><span></span><span></span>
-                </div>
-                Winby
-            </a>
+            <a href="#" class="nav-logo">Winby</a>
             <div class="nav-links">
                 <a href="#features">Features</a>
-                <a href="#how-it-works">How it Works</a>
+                <a href="#how">How It Works</a>
                 <a href="https://github.com/obra/winby">GitHub</a>
-                <a href="https://github.com/obra/winby/releases/latest" class="btn btn-primary">
-                    Download
-                </a>
+                <a href="https://github.com/obra/winby/releases/latest" class="btn-download">Download</a>
             </div>
         </div>
     </nav>
 
     <section class="hero">
-        <div class="hero-badge">
-            <span class="dot"></span>
-            Free & Open Source
+        <div class="container">
+            <p class="hero-eyebrow">Window manager for macOS</p>
+            <h1>Switch windows.<br>At the speed of thought.</h1>
+            <p class="hero-subtitle">Search by title, app, or even text visible in your windows. Keyboard-driven. Blazingly fast.</p>
+            <div class="hero-cta">
+                <a href="https://github.com/obra/winby/releases/latest">
+                    Download for macOS <span class="arrow">›</span>
+                </a>
+                <a href="https://github.com/obra/winby">
+                    View on GitHub <span class="arrow">›</span>
+                </a>
+            </div>
         </div>
-        <h1>
-            Switch windows<br>
-            <span class="gradient">at the speed of thought</span>
-        </h1>
-        <p class="hero-subtitle">
-            A keyboard-driven window manager for macOS. Search by title, app name, or even text visible in your windows.
-        </p>
-        <div class="hero-actions">
-            <a href="https://github.com/obra/winby/releases/latest" class="btn btn-primary">
-                <svg class="icon-download" viewBox="0 0 16 16" fill="currentColor">
-                    <path d="M8 12l-4-4h2.5V3h3v5H12L8 12z"/>
-                    <path d="M14 13v1H2v-1h12z"/>
-                </svg>
-                Download for macOS
-            </a>
-            <a href="https://github.com/obra/winby" class="btn btn-secondary">
-                View on GitHub
-            </a>
-        </div>
-        <div class="shortcut-display">
-            <div class="key" id="key-cmd">⌘</div>
-            <span class="key-plus">+</span>
-            <div class="key" id="key-shift">⇧</div>
-            <span class="key-plus">+</span>
-            <div class="key" id="key-space">Space</div>
+        <div class="screenshot-showcase">
+            <img src="screenshot-sidebar.png" alt="Winby window switcher showing sidebar with window list and preview">
         </div>
     </section>
 
     <section class="features" id="features">
         <div class="container">
-            <span class="section-label">Features</span>
-            <h2 class="section-title">Everything you need to<br>manage windows efficiently</h2>
-            <p class="section-subtitle">
-                Built for developers and power users who live in their keyboard.
-            </p>
+            <div class="features-header">
+                <h2>Built for power users</h2>
+                <p>Every feature designed for speed and efficiency.</p>
+            </div>
             <div class="features-grid">
-                <div class="feature-card">
+                <div class="feature">
                     <div class="feature-icon">🔍</div>
                     <h3>Instant Search</h3>
-                    <p>Find any window by typing. Fuzzy search matches window titles and application names as you type.</p>
+                    <p>Type to filter windows by title or app name. Fuzzy matching finds what you need, fast.</p>
                 </div>
-                <div class="feature-card">
+                <div class="feature">
                     <div class="feature-icon">👁</div>
-                    <h3>Window Previews</h3>
-                    <p>See live thumbnails of every window. Preview content before switching to make the right choice.</p>
+                    <h3>Live Previews</h3>
+                    <p>See window thumbnails before switching. Know exactly where you're going.</p>
                 </div>
-                <div class="feature-card">
+                <div class="feature">
                     <div class="feature-icon">📝</div>
                     <h3>Content Search</h3>
-                    <p>Search by what's visible in your windows using OCR. Find that terminal, document, or browser tab instantly.</p>
+                    <p>Search by text visible in windows using OCR. Find that document by what's in it.</p>
                 </div>
-                <div class="feature-card">
+                <div class="feature">
                     <div class="feature-icon">⌨️</div>
                     <h3>Keyboard First</h3>
-                    <p>Navigate entirely with your keyboard. Arrow keys to browse, Return to switch, Escape to dismiss.</p>
+                    <p>Navigate with arrow keys, switch with Return. Your hands never leave the keyboard.</p>
                 </div>
-                <div class="feature-card">
+                <div class="feature">
                     <div class="feature-icon">⚡</div>
-                    <h3>Customizable Hotkey</h3>
-                    <p>Use the default ⌘⇧Space, or set your own. You can even replace ⌘Tab for seamless integration.</p>
+                    <h3>Custom Hotkey</h3>
+                    <p>Use ⌘⇧Space, or set your own. Even replace ⌘Tab for seamless switching.</p>
                 </div>
-                <div class="feature-card">
+                <div class="feature">
                     <div class="feature-icon">🚀</div>
-                    <h3>Launch at Login</h3>
-                    <p>Always ready when you need it. Winby starts automatically and lives in your menu bar.</p>
+                    <h3>Always Ready</h3>
+                    <p>Starts at login and lives in your menu bar. There when you need it, invisible when you don't.</p>
                 </div>
             </div>
         </div>
     </section>
 
-    <section class="how-it-works" id="how-it-works">
+    <section class="gallery">
+        <div class="gallery-header">
+            <h2>See it in action</h2>
+        </div>
+        <div class="gallery-grid">
+            <div class="gallery-item">
+                <img src="screenshot-sidebar.png" alt="Winby sidebar with window list">
+                <div class="gallery-caption">
+                    <h3>Window List</h3>
+                    <p>All your windows at a glance with live previews</p>
+                </div>
+            </div>
+            <div class="gallery-item">
+                <img src="screenshot-search.png" alt="Winby search in action">
+                <div class="gallery-caption">
+                    <h3>Instant Search</h3>
+                    <p>Type to filter and find any window instantly</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="how" id="how">
         <div class="container">
-            <span class="section-label">How it Works</span>
-            <h2 class="section-title">Simple, fast, powerful</h2>
-            <p class="section-subtitle">
-                Three steps to window switching nirvana.
-            </p>
+            <div class="how-header">
+                <h2>How it works</h2>
+            </div>
+            <div class="shortcut-display">
+                <div class="key">⌘</div>
+                <span class="key-plus">+</span>
+                <div class="key">⇧</div>
+                <span class="key-plus">+</span>
+                <div class="key">Space</div>
+            </div>
             <div class="steps">
                 <div class="step">
-                    <div class="step-number">1</div>
-                    <h3>Press Your Hotkey</h3>
-                    <p>Hit ⌘⇧Space (or your custom shortcut) to summon the window sidebar.</p>
+                    <div class="step-number">01</div>
+                    <h3>Press your hotkey</h3>
+                    <p>Summon Winby with a keyboard shortcut. The window list appears instantly.</p>
                 </div>
                 <div class="step">
-                    <div class="step-number">2</div>
-                    <h3>Type to Search</h3>
-                    <p>Start typing to filter windows. Use arrow keys to navigate the list.</p>
+                    <div class="step-number">02</div>
+                    <h3>Type to search</h3>
+                    <p>Start typing to filter. Use arrow keys to navigate the list.</p>
                 </div>
                 <div class="step">
-                    <div class="step-number">3</div>
-                    <h3>Switch Instantly</h3>
-                    <p>Press Return to jump to your window. It's that simple.</p>
+                    <div class="step-number">03</div>
+                    <h3>Press Return</h3>
+                    <p>Jump straight to your window. Done in under a second.</p>
                 </div>
             </div>
         </div>
@@ -672,68 +611,28 @@
 
     <section class="cta">
         <div class="container">
-            <div class="cta-box">
-                <h2>Ready to switch faster?</h2>
-                <p>Download Winby and transform your window management workflow.</p>
-                <a href="https://github.com/obra/winby/releases/latest" class="btn btn-primary">
-                    <svg class="icon-download" viewBox="0 0 16 16" fill="currentColor">
-                        <path d="M8 12l-4-4h2.5V3h3v5H12L8 12z"/>
-                        <path d="M14 13v1H2v-1h12z"/>
-                    </svg>
+            <h2>Ready to switch faster?</h2>
+            <div class="cta-buttons">
+                <a href="https://github.com/obra/winby/releases/latest" class="btn-large btn-primary">
                     Download for macOS
                 </a>
-                <p class="requirements">Requires macOS 14.0 (Sonoma) or later</p>
+                <a href="https://github.com/obra/winby" class="btn-large btn-outline">
+                    View Source
+                </a>
             </div>
+            <p class="cta-note">Free and open source. Requires macOS 14.0 or later.</p>
         </div>
     </section>
 
     <footer>
         <div class="container">
-            <p>
-                Made by <a href="https://github.com/obra">Jesse Vincent</a> ·
-                <a href="https://github.com/obra/winby">Source on GitHub</a> ·
-                MIT License
-            </p>
+            <p>Made by Jesse Vincent</p>
+            <div class="footer-links">
+                <a href="https://github.com/obra/winby">GitHub</a>
+                <a href="https://github.com/obra/winby/releases">Releases</a>
+                <a href="https://github.com/obra/winby/issues">Issues</a>
+            </div>
         </div>
     </footer>
-
-    <script>
-        // Animate keyboard shortcut on scroll into view
-        const keys = document.querySelectorAll('.key');
-        let animationInterval;
-
-        function animateKeys() {
-            const sequence = [0, 1, 2];
-            let i = 0;
-
-            animationInterval = setInterval(() => {
-                keys.forEach(k => k.classList.remove('active'));
-                if (i < sequence.length) {
-                    keys[sequence[i]].classList.add('active');
-                    i++;
-                } else {
-                    clearInterval(animationInterval);
-                    setTimeout(() => {
-                        keys.forEach(k => k.classList.remove('active'));
-                    }, 200);
-                    setTimeout(animateKeys, 2000);
-                }
-            }, 150);
-        }
-
-        // Start animation after page load
-        setTimeout(animateKeys, 1000);
-
-        // Smooth scroll for anchor links
-        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-            anchor.addEventListener('click', function (e) {
-                e.preventDefault();
-                const target = document.querySelector(this.getAttribute('href'));
-                if (target) {
-                    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }
-            });
-        });
-    </script>
 </body>
 </html>
