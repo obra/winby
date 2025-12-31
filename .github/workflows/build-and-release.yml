@@ -74,6 +74,7 @@ jobs:
         UTILS=".build/checkouts/KeyboardShortcuts/Sources/KeyboardShortcuts/Utilities.swift"
         if [ -f "$UTILS" ]; then
           echo "Patching KeyboardShortcuts Utilities.swift..."
+          chmod u+w "$UTILS"
           sed -i '' 's/bundle: \.module/bundle: .keyboardShortcutsBundle/g' "$UTILS"
           echo '' >> "$UTILS"
           echo '// Patched by Winby CI - flexible bundle lookup for app distribution' >> "$UTILS"
