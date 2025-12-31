@@ -67,42 +67,36 @@ jobs:
 
     - name: Build Swift package
       run: |
-        # First build to generate the resource accessor
-        swift build --configuration release --arch arm64 || true
+        # Resolve dependencies first
+        swift package resolve
 
-        # Patch KeyboardShortcuts resource accessor to check Contents/Resources
-        ACCESSOR=".build/arm64-apple-macosx/release/KeyboardShortcuts.build/DerivedSources/resource_bundle_accessor.swift"
-        if [ -f "$ACCESSOR" ]; then
-          echo "Patching KeyboardShortcuts resource accessor..."
-          echo 'import Foundation' > "$ACCESSOR"
-          echo '' >> "$ACCESSOR"
-          echo 'extension Foundation.Bundle {' >> "$ACCESSOR"
-          echo '    static let module: Bundle = {' >> "$ACCESSOR"
-          echo '        let bundleName = "KeyboardShortcuts_KeyboardShortcuts.bundle"' >> "$ACCESSOR"
-          echo '        let candidates = [' >> "$ACCESSOR"
-          echo '            Bundle.main.resourceURL?.appendingPathComponent(bundleName),' >> "$ACCESSOR"
-          echo '            Bundle.main.bundleURL.appendingPathComponent(bundleName),' >> "$ACCESSOR"
-          echo '            Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(bundleName)' >> "$ACCESSOR"
-          echo '        ]' >> "$ACCESSOR"
-          echo '        for candidate in candidates {' >> "$ACCESSOR"
-          echo '            if let path = candidate?.path, let bundle = Bundle(path: path) {' >> "$ACCESSOR"
-          echo '                return bundle' >> "$ACCESSOR"
-          echo '            }' >> "$ACCESSOR"
-          echo '        }' >> "$ACCESSOR"
-          echo '        Swift.fatalError("could not load resource bundle")' >> "$ACCESSOR"
-          echo '    }()' >> "$ACCESSOR"
-          echo '}' >> "$ACCESSOR"
-
-          # Force recompilation
-          echo "Removing KeyboardShortcuts compiled artifacts..."
-          rm -rf .build/arm64-apple-macosx/release/KeyboardShortcuts.build/Objects-normal
-          rm -rf .build/arm64-apple-macosx/release/Modules/KeyboardShortcuts*
-
-          echo "Patched accessor:"
-          cat "$ACCESSOR"
+        # Patch KeyboardShortcuts to not crash on missing bundle
+        UTILS=".build/checkouts/KeyboardShortcuts/Sources/KeyboardShortcuts/Utilities.swift"
+        if [ -f "$UTILS" ]; then
+          echo "Patching KeyboardShortcuts Utilities.swift..."
+          sed -i '' 's/bundle: \.module/bundle: .keyboardShortcutsBundle/g' "$UTILS"
+          echo '' >> "$UTILS"
+          echo '// Patched by Winby CI - flexible bundle lookup for app distribution' >> "$UTILS"
+          echo 'extension Bundle {' >> "$UTILS"
+          echo '    static let keyboardShortcutsBundle: Bundle = {' >> "$UTILS"
+          echo '        let bundleName = "KeyboardShortcuts_KeyboardShortcuts.bundle"' >> "$UTILS"
+          echo '        let candidates = [' >> "$UTILS"
+          echo '            Bundle.main.resourceURL?.appendingPathComponent(bundleName),' >> "$UTILS"
+          echo '            Bundle.main.bundleURL.appendingPathComponent(bundleName),' >> "$UTILS"
+          echo '            Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(bundleName)' >> "$UTILS"
+          echo '        ]' >> "$UTILS"
+          echo '        for candidate in candidates {' >> "$UTILS"
+          echo '            if let path = candidate?.path, let bundle = Bundle(path: path) {' >> "$UTILS"
+          echo '                return bundle' >> "$UTILS"
+          echo '            }' >> "$UTILS"
+          echo '        }' >> "$UTILS"
+          echo '        return Bundle.main' >> "$UTILS"
+          echo '    }()' >> "$UTILS"
+          echo '}' >> "$UTILS"
+          echo "Patched Utilities.swift"
         fi
 
-        # Rebuild with patched accessor
+        # Build
         swift build --configuration release --arch arm64
 
     - name: Create app bundle structure
