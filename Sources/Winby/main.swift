@@ -182,9 +182,29 @@ func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePoin
 @_silgen_name("_AXUIElementCreateWithRemoteToken") @discardableResult
 func _AXUIElementCreateWithRemoteToken(_ data: CFData) -> Unmanaged<AXUIElement>?
 
-/// Brute-force find AXUIElement for a window ID on any space
-/// This is alt-tab's approach for getting AXUIElements for windows on other spaces
-/// that the normal AX APIs can't see
+/// Brute-force find AXUIElement for a window ID on any space.
+///
+/// The normal AX API (`AXUIElementCopyAttributeValue` with `kAXWindowsAttribute`)
+/// only returns windows on the current space. For windows on other spaces, we need
+/// this brute-force approach using `_AXUIElementCreateWithRemoteToken`.
+///
+/// This technique was discovered by alt-tab-macos (issue #1324, Feb 2025):
+/// 1. Construct a 20-byte token with the process PID and an element ID
+/// 2. Iterate through element IDs 0-1000 (apps reuse IDs, so they stay low)
+/// 3. For each valid element, check if its window ID matches our target
+///
+/// The token format is: pid (4 bytes) + 0 (4 bytes) + 0x636f636f (4 bytes) + elementID (8 bytes)
+/// The magic number 0x636f636f is "coco" in ASCII, likely a Cocoa marker.
+///
+/// Why this matters: Without the AXUIElement, calling `_SLPSSetFrontProcessWithOptions`
+/// will activate the window within its space, but won't trigger the space switch animation.
+/// You MUST call `AXUIElementPerformAction(element, kAXRaiseAction)` with a valid element
+/// to make macOS switch to that space.
+///
+/// - Parameters:
+///   - targetWindowID: The CGWindowID of the window to find
+///   - pid: The process ID that owns the window
+/// - Returns: The AXUIElement if found, nil otherwise
 func findAXUIElement(forWindowID targetWindowID: UInt32, pid: pid_t) -> AXUIElement? {
     // Token format: pid (4 bytes) + 0 (4 bytes) + 0x636f636f (4 bytes) + elementID (8 bytes)
     var remoteToken = Data(count: 20)
@@ -2119,9 +2139,18 @@ class WindowManager: ObservableObject {
         return true
     }
 
-    /// Fully focus a window (used when committing selection)
-    /// Uses alt-tab's approach: SLPSSetFrontProcessWithOptions + makeKeyWindow + AXRaise
-    /// The userGenerated mode triggers automatic space switching
+    /// Focus a window, switching spaces if necessary.
+    ///
+    /// Uses alt-tab's proven focus sequence with private SkyLight APIs:
+    /// 1. `_SLPSSetFrontProcessWithOptions` with `userGenerated` mode (0x200)
+    ///    - Brings the process to front and signals user intent for space switch
+    /// 2. `makeKeyWindow` via `SLPSPostEventRecordTo`
+    ///    - Sends binary protocol to WindowServer to make the window key
+    /// 3. `AXUIElementPerformAction(element, kAXRaiseAction)`
+    ///    - This is the crucial step that actually triggers space switching
+    ///
+    /// For windows on other spaces, the normal AX API can't find them, so we use
+    /// `findAXUIElement(forWindowID:pid:)` to brute-force discover the element.
     func focusWindow(_ windowID: UInt32) {
         guard let window = windows.first(where: { $0.windowID == windowID }) else {
             debugLog("focusWindow: window \(windowID) not found")
