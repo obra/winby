@@ -153,6 +153,24 @@ func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePoin
 @_silgen_name("CGSSetGlobalHotKeyOperatingMode")
 func CGSSetGlobalHotKeyOperatingMode(_ connection: Int32, _ mode: Int32) -> CGError
 
+// Private API for hardware-accelerated window capture (can capture minimized/other-space windows)
+typealias CGSConnectionID = UInt32
+
+@_silgen_name("CGSMainConnectionID")
+func CGSMainConnectionID() -> CGSConnectionID
+
+struct CGSWindowCaptureOptions: OptionSet {
+    let rawValue: UInt32
+    static let ignoreGlobalClipShape = CGSWindowCaptureOptions(rawValue: 1 << 11)
+    static let nominalResolution = CGSWindowCaptureOptions(rawValue: 1 << 9)
+    static let bestResolution = CGSWindowCaptureOptions(rawValue: 1 << 8)
+    static let fullSize = CGSWindowCaptureOptions(rawValue: 1 << 19)
+}
+
+// Match AltTab's exact declaration
+@_silgen_name("CGSHWCaptureWindowList")
+func CGSHWCaptureWindowList(_ cid: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>, _ windowCount: UInt32, _ options: CGSWindowCaptureOptions) -> Unmanaged<CFArray>
+
 // MARK: - Async Semaphore
 
 actor AsyncSemaphore {
@@ -788,49 +806,60 @@ class WindowManager: ObservableObject {
             return nil
         }
 
-        // Capture at higher resolution for OCR (thumbnails are too small)
+        // Try to capture the window - first via ScreenCaptureKit, then via private API
+        var cgImage: CGImage?
+
+        // Try ScreenCaptureKit first (works for most on-screen windows)
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let scWindow = content.windows.first(where: { $0.windowID == windowID }) else {
-                return nil
+            if let scWindow = content.windows.first(where: { $0.windowID == windowID }) {
+                let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+                let config = SCStreamConfiguration()
+                // Use actual window size or cap at reasonable resolution for OCR
+                config.width = min(Int(scWindow.frame.width), 1920)
+                config.height = min(Int(scWindow.frame.height), 1080)
+                config.scalesToFit = false
+                config.showsCursor = false
+
+                cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
             }
-
-            let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-            let config = SCStreamConfiguration()
-            // Use actual window size or cap at reasonable resolution for OCR
-            config.width = min(Int(scWindow.frame.width), 1920)
-            config.height = min(Int(scWindow.frame.height), 1080)
-            config.scalesToFit = false
-            config.showsCursor = false
-
-            let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-
-            // Check if screenshot changed - if not, use cached content
-            let newHash = quickImageHash(cgImage)
-            if let oldHash = screenshotHashes[windowID], oldHash == newHash {
-                // Screenshot unchanged, return cached content
-                if let cached = contentCache[windowID] {
-                    debugLog("OCR: Screenshot unchanged for window \(windowID), using cache")
-                    return cached
-                }
-            }
-
-            // Screenshot changed or no cache, run OCR
-            let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-            if let text = ocrImage(nsImage) {
-                // Update hash for next comparison
-                await MainActor.run {
-                    screenshotHashes[windowID] = newHash
-                    // Also cache by pid+title for when this becomes a background tab
-                    tabOcrCache[cacheKey] = text
-                }
-                return text
-            }
-            return nil
         } catch {
-            debugLog("OCR capture error for window \(windowID): \(error)")
+            debugLog("OCR: ScreenCaptureKit failed for window \(windowID): \(error)")
+        }
+
+        // Fallback: try private API (works for minimized/other-space windows)
+        if cgImage == nil {
+            debugLog("OCR: Trying private API for window \(windowID)")
+            cgImage = captureWindowViaPrivateAPI(windowID: windowID, fullSize: true)
+        }
+
+        guard let capturedImage = cgImage else {
+            debugLog("OCR: All capture methods failed for window \(windowID)")
             return nil
         }
+
+        // Check if screenshot changed - if not, use cached content
+        let newHash = quickImageHash(capturedImage)
+        if let oldHash = screenshotHashes[windowID], oldHash == newHash {
+            // Screenshot unchanged, return cached content
+            if let cached = contentCache[windowID] {
+                debugLog("OCR: Screenshot unchanged for window \(windowID), using cache")
+                return cached
+            }
+        }
+
+        // Screenshot changed or no cache, run OCR
+        let nsImage = NSImage(cgImage: capturedImage, size: NSSize(width: capturedImage.width, height: capturedImage.height))
+        if let text = ocrImage(nsImage) {
+            // Update hash for next comparison
+            await MainActor.run {
+                screenshotHashes[windowID] = newHash
+                // Also cache by pid+title for when this becomes a background tab
+                tabOcrCache[cacheKey] = text
+            }
+            return text
+        }
+        return nil
     }
 
     /// Debug: dump what content we can get from all windows
@@ -1304,6 +1333,26 @@ class WindowManager: ObservableObject {
         return result
     }
 
+    /// Capture a window image using CGSHWCaptureWindowList private API
+    /// This can capture minimized windows and windows on other spaces that ScreenCaptureKit cannot
+    func captureWindowViaPrivateAPI(windowID: UInt32, fullSize: Bool = false) -> CGImage? {
+        var wid = CGWindowID(windowID)
+        let options: CGSWindowCaptureOptions = fullSize
+            ? [.ignoreGlobalClipShape, .bestResolution, .fullSize]
+            : [.ignoreGlobalClipShape, .bestResolution]
+
+        // Match AltTab's exact calling pattern
+        let result = CGSHWCaptureWindowList(CGSMainConnectionID(), &wid, 1, options)
+        let images = result.takeRetainedValue() as? [CGImage] ?? []
+
+        guard let image = images.first else {
+            debugLog("CGSHWCaptureWindowList failed for window \(windowID)")
+            return nil
+        }
+
+        return image
+    }
+
     func thumbnail(for windowID: UInt32, maxSize: CGSize = CGSize(width: 200, height: 150)) async -> NSImage? {
         // Get window info
         guard let window = windows.first(where: { $0.windowID == windowID }) else {
@@ -1356,11 +1405,28 @@ class WindowManager: ObservableObject {
                 return nsImage
             }
         } catch {
-            // ScreenCaptureKit failed - silently fall back to app icon
-            // (permission denied is expected if user hasn't granted screen recording)
+            // ScreenCaptureKit failed - try private API fallback
+            debugLog("ScreenCaptureKit failed for window \(windowID), trying private API")
         }
 
-        // Fallback: use app icon
+        // Fallback: try private API (works for minimized/other-space windows)
+        if let cgImage = captureWindowViaPrivateAPI(windowID: windowID, fullSize: false) {
+            debugLog("Private API captured window \(windowID): \(cgImage.width)x\(cgImage.height)")
+            let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+            let nsImage = NSImage(cgImage: cgImage, size: size)
+
+            // Scale down to maxSize
+            let scale = min(maxSize.width / size.width, maxSize.height / size.height)
+            let scaledSize = CGSize(width: size.width * scale, height: size.height * scale)
+            let scaledImage = NSImage(size: scaledSize)
+            scaledImage.lockFocus()
+            nsImage.draw(in: NSRect(origin: .zero, size: scaledSize))
+            scaledImage.unlockFocus()
+
+            return scaledImage
+        }
+
+        // Final fallback: use app icon
         if let app = NSRunningApplication(processIdentifier: window.pid),
            let icon = app.icon {
             return icon
@@ -2921,6 +2987,7 @@ struct PreviewPanelView: View {
         // Get screen size for max capture dimensions
         let screenSize = NSScreen.main?.frame.size ?? CGSize(width: 1920, height: 1080)
 
+        // Try ScreenCaptureKit first (works for most on-screen windows)
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
             if let scWindow = content.windows.first(where: { $0.windowID == windowID }) {
@@ -2939,7 +3006,12 @@ struct PreviewPanelView: View {
             debugLog("Preview capture failed: \(error)")
         }
 
-        // Fallback: try to get from thumbnail cache
+        // Fallback: try private API (works for minimized/other-space windows)
+        if let cgImage = manager.captureWindowViaPrivateAPI(windowID: windowID, fullSize: true) {
+            return NSImage(cgImage: cgImage, size: NSSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height)))
+        }
+
+        // Final fallback: try to get from thumbnail cache
         return await manager.thumbnail(for: windowID, maxSize: CGSize(width: 800, height: 600))
     }
 }
