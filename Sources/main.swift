@@ -3180,24 +3180,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Save the currently focused app to restore later if Winby is dismissed without selection
+    func savePreviousFocus() {
+        // Get frontmost app that isn't Winby
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let winbyPID = ProcessInfo.processInfo.processIdentifier
+
+        if let app = frontmost, app.processIdentifier != winbyPID {
+            previouslyFocusedApp = app
+            debugLog("Saved previous app: \(app.localizedName ?? "unknown") (pid: \(app.processIdentifier))")
+        } else {
+            debugLog("Could not find non-Winby frontmost app (frontmost is \(frontmost?.localizedName ?? "none"))")
+        }
+        didSelectWindow = false
+    }
+
     func showSidebar() {
         guard let screen = NSScreen.main else { return }
         let screenFrame = screen.visibleFrame
-
-        // Save the currently focused app to restore if dismissed without selection
-        // Get the frontmost non-Winby app from workspace
-        let allApps = NSWorkspace.shared.runningApplications
-        let winbyPID = ProcessInfo.processInfo.processIdentifier
-
-        if let frontmost = allApps.first(where: {
-            $0.isActive && $0.processIdentifier != winbyPID
-        }) {
-            previouslyFocusedApp = frontmost
-            debugLog("Saved previous app: \(frontmost.localizedName ?? "unknown") (pid: \(frontmost.processIdentifier))")
-        } else {
-            debugLog("Could not find non-Winby frontmost app")
-        }
-        didSelectWindow = false
 
         // Disable system hotkeys (like Cmd+Tab) while our switcher is active
         _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 1)  // 1 = disable
@@ -3358,7 +3358,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         WindowManager.shared.isCycling = true
                         appDelegate.selectNextWindow()
                     } else {
-                        // First press: show sidebar, do NOT enter cycling mode
+                        // First press: save focus and show sidebar
+                        appDelegate.savePreviousFocus()
                         appDelegate.showSidebar()
                         appDelegate.selectNextWindow()
                     }
@@ -3406,7 +3407,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         self.selectNextWindow()
                     }
                 } else {
-                    // First press: show sidebar, do NOT enter cycling mode
+                    // First press: save focus and show sidebar
+                    self.savePreviousFocus()
                     self.showSidebar()
                     if goBackward {
                         self.selectPreviousWindow()
