@@ -40,10 +40,17 @@ class AppConfig: ObservableObject {
         didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
     }
 
+    /// When enabled, winby will cycle through background tabs after dismissal to cache their screenshots
+    /// This causes brief visible tab switching but ensures all tabs have preview images
+    @Published var cacheBackgroundTabs: Bool {
+        didSet { UserDefaults.standard.set(cacheBackgroundTabs, forKey: "cacheBackgroundTabs") }
+    }
+
     init() {
         self.debugMode = UserDefaults.standard.bool(forKey: "debugMode")
         self.launchAtLogin = SMAppService.mainApp.status == .enabled
         self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
+        self.cacheBackgroundTabs = UserDefaults.standard.bool(forKey: "cacheBackgroundTabs")
     }
 
     // MARK: - Permission Helpers
@@ -1555,6 +1562,90 @@ class WindowManager: ObservableObject {
         return image
     }
 
+    /// Generate a placeholder image that looks like a macOS window
+    /// Used when we can't capture a real screenshot (background tabs, etc.)
+    func generatePlaceholderWindow(title: String, appIcon: NSImage?, size: CGSize) -> NSImage {
+        let titleBarHeight: CGFloat = 28
+        let trafficLightSize: CGFloat = 12
+        let trafficLightSpacing: CGFloat = 8
+        let trafficLightLeftPadding: CGFloat = 14
+        let cornerRadius: CGFloat = 10
+
+        let image = NSImage(size: size)
+        image.lockFocus()
+
+        // Window background (dark mode style)
+        let windowPath = NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: cornerRadius, yRadius: cornerRadius)
+        NSColor(white: 0.15, alpha: 1.0).setFill()
+        windowPath.fill()
+
+        // Title bar background (slightly lighter)
+        let titleBarPath = NSBezierPath()
+        titleBarPath.move(to: NSPoint(x: 0, y: size.height - titleBarHeight))
+        titleBarPath.line(to: NSPoint(x: 0, y: size.height - cornerRadius))
+        titleBarPath.appendArc(withCenter: NSPoint(x: cornerRadius, y: size.height - cornerRadius),
+                               radius: cornerRadius, startAngle: 180, endAngle: 90, clockwise: true)
+        titleBarPath.line(to: NSPoint(x: size.width - cornerRadius, y: size.height))
+        titleBarPath.appendArc(withCenter: NSPoint(x: size.width - cornerRadius, y: size.height - cornerRadius),
+                               radius: cornerRadius, startAngle: 90, endAngle: 0, clockwise: true)
+        titleBarPath.line(to: NSPoint(x: size.width, y: size.height - titleBarHeight))
+        titleBarPath.close()
+        NSColor(white: 0.22, alpha: 1.0).setFill()
+        titleBarPath.fill()
+
+        // Traffic lights
+        let trafficLightY = size.height - titleBarHeight / 2 - trafficLightSize / 2
+        let colors: [NSColor] = [
+            NSColor(red: 1.0, green: 0.38, blue: 0.35, alpha: 1.0),  // Close (red)
+            NSColor(red: 1.0, green: 0.78, blue: 0.25, alpha: 1.0),  // Minimize (yellow)
+            NSColor(red: 0.3, green: 0.8, blue: 0.35, alpha: 1.0)    // Zoom (green)
+        ]
+        for (index, color) in colors.enumerated() {
+            let x = trafficLightLeftPadding + CGFloat(index) * (trafficLightSize + trafficLightSpacing)
+            let circleRect = NSRect(x: x, y: trafficLightY, width: trafficLightSize, height: trafficLightSize)
+            let circle = NSBezierPath(ovalIn: circleRect)
+            color.setFill()
+            circle.fill()
+        }
+
+        // Title text (centered in title bar, avoiding traffic lights)
+        let titleFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: titleFont,
+            .foregroundColor: NSColor(white: 0.9, alpha: 1.0)
+        ]
+        let titleString = NSAttributedString(string: title, attributes: titleAttributes)
+        let titleSize = titleString.size()
+        let titleX = max(trafficLightLeftPadding + 3 * (trafficLightSize + trafficLightSpacing) + 10,
+                         (size.width - titleSize.width) / 2)
+        let titleY = size.height - titleBarHeight / 2 - titleSize.height / 2
+        let availableWidth = size.width - titleX - 10
+        if availableWidth > 50 {
+            let drawRect = NSRect(x: titleX, y: titleY, width: min(titleSize.width, availableWidth), height: titleSize.height)
+            titleString.draw(with: drawRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+        }
+
+        // App icon centered in content area
+        if let icon = appIcon {
+            let contentHeight = size.height - titleBarHeight
+            let iconSize = min(contentHeight * 0.5, size.width * 0.4, 128)
+            let iconX = (size.width - iconSize) / 2
+            let iconY = (contentHeight - iconSize) / 2
+            let iconRect = NSRect(x: iconX, y: iconY, width: iconSize, height: iconSize)
+            icon.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 0.8)
+        }
+
+        // Subtle border
+        let borderPath = NSBezierPath(roundedRect: NSRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5),
+                                       xRadius: cornerRadius, yRadius: cornerRadius)
+        NSColor(white: 0.3, alpha: 1.0).setStroke()
+        borderPath.lineWidth = 1
+        borderPath.stroke()
+
+        image.unlockFocus()
+        return image
+    }
+
     func thumbnail(for windowID: UInt32, maxSize: CGSize = CGSize(width: 200, height: 150)) async -> NSImage? {
         debugLog("thumbnail: starting for window \(windowID)")
 
@@ -1574,12 +1665,12 @@ class WindowManager: ObservableObject {
                 return cached
             }
             debugLog("thumbnail: cache MISS for '\(cacheKey)' (have \(cacheLock.withLock { _tabScreenshotCache.count }) cached)")
-            // Background tabs can't be captured directly - fall back to app icon
-            if let app = NSRunningApplication(processIdentifier: window.pid),
-               let icon = app.icon {
-                return icon
-            }
-            return thumbnailCache[windowID]
+            // Background tabs can't be captured directly - generate placeholder window
+            let appIcon = NSRunningApplication(processIdentifier: window.pid)?.icon
+            // Use a reasonable window size for the placeholder (16:10 aspect ratio)
+            let placeholderSize = CGSize(width: maxSize.width, height: maxSize.width * 0.625)
+            let placeholder = generatePlaceholderWindow(title: window.title, appIcon: appIcon, size: placeholderSize)
+            return placeholder
         }
 
         // Try ScreenCaptureKit for visible windows
@@ -1927,6 +2018,94 @@ class WindowManager: ObservableObject {
         }
 
         return false
+    }
+
+    /// Cache screenshots for all background tabs by temporarily switching to each tab
+    /// This is called after the sidebar is dismissed when cacheBackgroundTabs is enabled
+    func cacheBackgroundTabScreenshots() async {
+        guard AppConfig.shared.cacheBackgroundTabs else { return }
+
+        debugLog("cacheBackgroundTabs: starting background tab caching")
+
+        // Group background tabs by their parent window
+        var tabsByParent: [UInt32: [(window: WindowInfo, index: Int)]] = [:]
+        for window in windows {
+            if let parentID = window.parentWindowID {
+                let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+                // Skip if already cached
+                if getTabScreenshot(key: cacheKey) != nil {
+                    debugLog("cacheBackgroundTabs: already cached '\(window.title)'")
+                    continue
+                }
+                tabsByParent[parentID, default: []].append((window, window.tabIndex))
+            }
+        }
+
+        if tabsByParent.isEmpty {
+            debugLog("cacheBackgroundTabs: no uncached background tabs found")
+            return
+        }
+
+        debugLog("cacheBackgroundTabs: found \(tabsByParent.values.flatMap { $0 }.count) uncached tabs in \(tabsByParent.count) windows")
+
+        // Process each parent window's tabs
+        for (parentID, tabs) in tabsByParent {
+            guard let parentWindow = windows.first(where: { $0.windowID == parentID }) else {
+                debugLog("cacheBackgroundTabs: parent window \(parentID) not found")
+                continue
+            }
+
+            let appName = parentWindow.appName
+            let pid = parentWindow.pid
+            let bundleId = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+
+            debugLog("cacheBackgroundTabs: processing \(tabs.count) tabs for \(appName)")
+
+            // Find the currently active tab (the one that matches the parent window title)
+            let originalActiveIndex = tabs.first { $0.window.title == parentWindow.title }?.index ?? 0
+
+            // Iterate through each background tab
+            for (tabWindow, tabIndex) in tabs {
+                debugLog("cacheBackgroundTabs: switching to tab \(tabIndex) '\(tabWindow.title)'")
+
+                // Switch to the tab
+                let switched: Bool
+                if bundleId == "com.apple.Safari" || bundleId == "com.google.Chrome" || bundleId.contains("Chrome") {
+                    switched = selectTabViaAppleScript(appName: appName, pid: pid, tabTitle: tabWindow.title, tabIndex: tabIndex)
+                } else {
+                    switched = selectTabViaAX(pid: pid, tabIndex: tabIndex, tabTitle: tabWindow.title)
+                }
+
+                if !switched {
+                    debugLog("cacheBackgroundTabs: failed to switch to tab '\(tabWindow.title)'")
+                    continue
+                }
+
+                // Wait for the tab to render
+                try? await Task.sleep(nanoseconds: 150_000_000) // 150ms
+
+                // Capture the screenshot using the parent window ID (now showing this tab)
+                if let cgImage = captureWindowViaPrivateAPI(windowID: parentID, fullSize: true) {
+                    let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+                    let nsImage = NSImage(cgImage: cgImage, size: size)
+                    let cacheKey = tabCacheKey(pid: pid, title: tabWindow.title)
+                    setTabScreenshot(key: cacheKey, image: nsImage)
+                    debugLog("cacheBackgroundTabs: cached screenshot for '\(tabWindow.title)'")
+                } else {
+                    debugLog("cacheBackgroundTabs: failed to capture '\(tabWindow.title)'")
+                }
+            }
+
+            // Restore the original active tab
+            debugLog("cacheBackgroundTabs: restoring original tab index \(originalActiveIndex)")
+            if bundleId == "com.apple.Safari" || bundleId == "com.google.Chrome" || bundleId.contains("Chrome") {
+                _ = selectTabViaAppleScript(appName: appName, pid: pid, tabTitle: parentWindow.title, tabIndex: originalActiveIndex)
+            } else {
+                _ = selectTabViaAX(pid: pid, tabIndex: originalActiveIndex, tabTitle: parentWindow.title)
+            }
+        }
+
+        debugLog("cacheBackgroundTabs: finished caching")
     }
 
     /// Try to find and click a tab with the given title in the window's tab bar
@@ -2432,6 +2611,8 @@ struct SettingsView: View {
 
             Section("General") {
                 Toggle("Launch at Login", isOn: $config.launchAtLogin)
+                Toggle("Cache Background Tabs", isOn: $config.cacheBackgroundTabs)
+                    .help("Cycle through tabs after dismissal to capture screenshots (causes brief flickering)")
                 Toggle("Debug Mode", isOn: $config.debugMode)
                     .help("Show debug controls and log to /tmp/wm_debug.log")
             }
@@ -3487,8 +3668,11 @@ struct PreviewPanelView: View {
             if let cached = manager.getTabScreenshot(key: cacheKey) {
                 return cached
             }
-            // Background tabs can't be captured - no fallback
-            return nil
+            // Background tabs can't be captured - generate placeholder window
+            let appIcon = NSRunningApplication(processIdentifier: window.pid)?.icon
+            // Use a larger size for preview panel (16:10 aspect ratio, typical window proportions)
+            let placeholderSize = CGSize(width: 800, height: 500)
+            return manager.generatePlaceholderWindow(title: window.title, appIcon: appIcon, size: placeholderSize)
         }
 
         // Try private API - it's fast and works for most windows
@@ -3986,6 +4170,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.window.animator().alphaValue = 0
         }, completionHandler: {
             self.window.orderOut(nil)
+
+            // Cache background tab screenshots if enabled
+            // Run after a short delay to let the UI settle
+            if AppConfig.shared.cacheBackgroundTabs {
+                Task {
+                    try? await Task.sleep(nanoseconds: 300_000_000) // 300ms delay
+                    await WindowManager.shared.cacheBackgroundTabScreenshots()
+                }
+            }
         })
     }
 
