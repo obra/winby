@@ -2,6 +2,12 @@
 
 All notable changes to Winby will be documented in this file.
 
+## [1.1.1] - 2025-01-01
+
+### Fixed
+- Search filtering now preserves original window order instead of reordering by match score
+- Selection stays on current window while typing, only moves if filtered out
+
 ## [1.1.0] - 2025-01-01
 
 ### Added
