@@ -361,6 +361,7 @@ class WindowManager: ObservableObject {
     private let cid: Int32
     private var refreshTimer: Timer?
     var isCycling = false  // When true, don't reorder windows during refresh
+    var sidebarVisible = false  // When true, preserve window order during refresh
 
     /// Lock for thread-safe cache access
     private let cacheLock = NSLock()
@@ -1290,6 +1291,7 @@ class WindowManager: ObservableObject {
                         isOnScreen: isOnScreen
                     )
                     windowInfo.isOnCurrentSpace = isOnCurrentSpace
+                    debugLog("AX add: \(appName) '\(title)' wid=\(windowID) onCurrentSpace=\(isOnCurrentSpace) onScreen=\(isOnScreen)")
                     newWindows.append(windowInfo)
                 } else {
                     // Has tabs - add each tab
@@ -1340,25 +1342,66 @@ class WindowManager: ObservableObject {
                         )
                         windowInfo.isOnCurrentSpace = isOnCurrentSpace
                         windowInfo.tabIndex = index
+                        debugLog("AX add tab: \(appName) '\(tabTitle)' wid=\(finalWindowID) parent=\(windowID) onCurrentSpace=\(isOnCurrentSpace) active=\(isActiveTab)")
                         newWindows.append(windowInfo)
                     }
                 }
             }
         }
 
+        debugLog("After AX enumeration: \(newWindows.count) windows")
+
         // Track which window IDs we've already added from AX enumeration
-        let axWindowIDs = Set(newWindows.map { $0.windowID })
+        // Include both windowID and parentWindowID to catch all real window IDs
+        var axWindowIDs = Set(newWindows.map { $0.windowID })
+        for window in newWindows {
+            if let parentID = window.parentWindowID {
+                axWindowIDs.insert(parentID)
+            }
+        }
+        debugLog("axWindowIDs (including parents): \(axWindowIDs.sorted())")
+
+        // Build list of windows by app for duplicate detection
+        let axWindowsByApp = Dictionary(grouping: newWindows, by: { $0.appName })
+
+        // Helper to normalize titles for comparison (strip terminal dimensions, handle ellipsis)
+        func normalizeTitle(_ title: String) -> String {
+            var t = title
+            // Strip terminal dimensions like " — 124×36" at the end
+            if let range = t.range(of: #" — \d+×\d+$"#, options: .regularExpression) {
+                t.removeSubrange(range)
+            }
+            // Replace ellipsis with empty for prefix matching
+            t = t.replacingOccurrences(of: "…", with: "")
+            return t
+        }
 
         // Add windows from OTHER spaces using CG info (AX can't see them)
         // These are windows in cgWindowInfo but NOT in currentSpaceWindowIDs and NOT already added
         for (windowID, cgInfo) in cgWindowInfo {
-            // Skip if already added via AX, or if on current space (would have been found by AX)
+            // Skip if already added via AX (including as parent of a tab), or if on current space
             if axWindowIDs.contains(windowID) || currentSpaceWindowIDs.contains(windowID) {
                 continue
             }
 
             // Skip windows without titles
             if cgInfo.title.isEmpty { continue }
+
+            // Skip if we have an AX window from the same app with a matching title
+            // This catches background tabs which have different CG window IDs
+            if let axWindows = axWindowsByApp[cgInfo.appName] {
+                let cgNorm = normalizeTitle(cgInfo.title)
+                let isDuplicate = axWindows.contains { axWindow in
+                    let axNorm = normalizeTitle(axWindow.title)
+                    return axNorm == cgNorm ||
+                           axNorm.contains(cgNorm) ||
+                           cgNorm.contains(axNorm)
+                }
+                if isDuplicate {
+                    debugLog("CG skip duplicate title: \(cgInfo.appName) '\(cgInfo.title)' wid=\(windowID)")
+                    continue
+                }
+            }
 
             // Skip tiny windows
             if cgInfo.frame.width < 100 || cgInfo.frame.height < 100 { continue }
@@ -1379,12 +1422,15 @@ class WindowManager: ObservableObject {
                 isOnScreen: cgInfo.isOnScreen
             )
             windowInfo.isOnCurrentSpace = false
+            debugLog("CG add other-space: \(cgInfo.appName) '\(cgInfo.title)' wid=\(windowID)")
             newWindows.append(windowInfo)
         }
 
+        debugLog("After CG enumeration: \(newWindows.count) windows total")
+
         // Sort by z-order (front to back), windows not in z-order map go to end
-        // But if we're cycling, preserve the current order to avoid jumping
-        if isCycling && !windows.isEmpty {
+        // But if sidebar is visible, preserve the current order to avoid jumping
+        if (isCycling || sidebarVisible) && !windows.isEmpty {
             // Preserve existing order - sort new windows by their position in current list
             // Use reduce to handle potential duplicate windowIDs (keep first occurrence)
             var currentOrder: [UInt32: Int] = [:]
@@ -2309,11 +2355,11 @@ struct WindowRow: View {
         .padding(.vertical, 4)
         .padding(.leading, window.isClusteredTab ? 20 : 8)  // Indent clustered tabs
         .padding(.trailing, 8)
-        .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+        .background(isSelected ? Color.accentColor.opacity(0.4) : Color.clear)
         .cornerRadius(6)
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 2)
+                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 2.5)
         )
     }
 }
@@ -3695,6 +3741,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             display: false
         )
 
+        // Select the current window (first in list) when sidebar opens
+        let manager = WindowManager.shared
+        manager.sidebarVisible = true
+        if let firstWindow = manager.windows.first {
+            manager.selectedWindowID = firstWindow.windowID
+        }
+
         // Fade in
         window.alphaValue = 0
         window.orderFront(nil)
@@ -3722,6 +3775,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Clear cycling state
         isTabCycling = false
         WindowManager.shared.isCycling = false
+        WindowManager.shared.sidebarVisible = false
 
         // Re-enable system hotkeys
         _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 0)  // 0 = enable
@@ -3841,9 +3895,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         appDelegate.selectNextWindow()
                     } else {
                         // First press: save focus and show sidebar
+                        // showSidebar() selects the current window (index 0)
                         appDelegate.savePreviousFocus()
                         appDelegate.showSidebar()
-                        appDelegate.selectNextWindow()
                     }
                 }
                 return noErr
@@ -3890,13 +3944,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 } else {
                     // First press: save focus and show sidebar
+                    // showSidebar() selects the current window (index 0)
                     self.savePreviousFocus()
                     self.showSidebar()
-                    if goBackward {
-                        self.selectPreviousWindow()
-                    } else {
-                        self.selectNextWindow()
-                    }
                 }
             }
         }
@@ -4050,10 +4100,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self = self else { return }
 
                     if !self.window.isVisible {
-                        // First shortcut press: show sidebar, select first window
+                        // First shortcut press: show sidebar
+                        // showSidebar() selects the current window (index 0)
                         // Do NOT enter cycling mode yet - release will keep window open
                         self.showSidebar()
-                        self.selectNextWindow()
                     } else {
                         // Second+ shortcut press while visible: NOW enter cycling mode
                         self.isTabCycling = true
