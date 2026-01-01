@@ -332,15 +332,21 @@ struct WindowInfo: Identifiable, Hashable {
     var duplicateIndex: Int = 0  // 0-based index for windows with same title in same app
     var isClusteredTab: Bool = false  // True if this is a non-frontmost tab in a cluster
 
+    // Cached app icon (looked up once at creation, not on every access)
+    let appIcon: NSImage?
+
     // Unique ID for SwiftUI (handles tabs sharing same windowID)
     var id: String {
         "\(windowID)-\(pid)-\(title)-\(duplicateIndex)"
     }
 
-    /// Get the app icon from the running application
-    var appIcon: NSImage? {
-        guard let app = NSRunningApplication(processIdentifier: pid) else { return nil }
-        return app.icon
+    // Hashable conformance - use id (excludes appIcon since NSImage isn't Hashable)
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+
+    static func == (lhs: WindowInfo, rhs: WindowInfo) -> Bool {
+        lhs.id == rhs.id
     }
 
     var displayTitle: String {
@@ -351,14 +357,6 @@ struct WindowInfo: Identifiable, Hashable {
             return "\(title) (\(duplicateIndex + 1))"
         }
         return title
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-
-    static func == (lhs: WindowInfo, rhs: WindowInfo) -> Bool {
-        lhs.id == rhs.id
     }
 }
 
@@ -1237,6 +1235,9 @@ class WindowManager: ObservableObject {
             let appName = app.localizedName ?? "Unknown"
             if Self.excludedApps.contains(appName) { continue }
 
+            // Cache the app icon once per app (avoid repeated lookups)
+            let appIcon = app.icon
+
             let appElement = AXUIElementCreateApplication(pid)
             var windowsRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
@@ -1316,7 +1317,8 @@ class WindowManager: ObservableObject {
                         appName: appName,
                         title: title,
                         frame: frame,
-                        isOnScreen: isOnScreen
+                        isOnScreen: isOnScreen,
+                        appIcon: appIcon
                     )
                     windowInfo.isOnCurrentSpace = isOnCurrentSpace
                     debugLog("AX add: \(appName) '\(title)' wid=\(windowID) onCurrentSpace=\(isOnCurrentSpace) onScreen=\(isOnScreen)")
@@ -1366,7 +1368,8 @@ class WindowManager: ObservableObject {
                             appName: appName,
                             title: tabTitle,
                             frame: frame,
-                            isOnScreen: isActiveTab
+                            isOnScreen: isActiveTab,
+                            appIcon: appIcon
                         )
                         windowInfo.isOnCurrentSpace = isOnCurrentSpace
                         windowInfo.tabIndex = index
@@ -1434,11 +1437,23 @@ class WindowManager: ObservableObject {
             // Skip tiny windows
             if cgInfo.frame.width < 100 || cgInfo.frame.height < 100 { continue }
 
+            // Skip phantom windows that don't belong to any space
+            // Real windows belong to at least one space; orphaned/zombie windows have empty space list
+            let windowArray = [windowID as CFNumber] as CFArray
+            let spaces = CGSCopySpacesForWindows(CGSMainConnectionID(), 0x7, windowArray) as? [CGSSpaceID] ?? []
+            if spaces.isEmpty {
+                debugLog("CG skip phantom window (no space): \(cgInfo.appName) '\(cgInfo.title)' wid=\(windowID)")
+                continue
+            }
+
             // Skip our own windows
             if cgInfo.pid == myPID { continue }
 
             // Skip excluded apps
             if Self.excludedApps.contains(cgInfo.appName) { continue }
+
+            // Get app icon for this PID
+            let otherSpaceAppIcon = NSRunningApplication(processIdentifier: cgInfo.pid)?.icon
 
             var windowInfo = WindowInfo(
                 windowID: windowID,
@@ -1447,7 +1462,8 @@ class WindowManager: ObservableObject {
                 appName: cgInfo.appName,
                 title: cgInfo.title,
                 frame: cgInfo.frame,
-                isOnScreen: cgInfo.isOnScreen
+                isOnScreen: cgInfo.isOnScreen,
+                appIcon: otherSpaceAppIcon
             )
             windowInfo.isOnCurrentSpace = false
             debugLog("CG add other-space: \(cgInfo.appName) '\(cgInfo.title)' wid=\(windowID)")
@@ -2042,7 +2058,15 @@ class WindowManager: ObservableObject {
     /// Cache screenshots for all background tabs by temporarily switching to each tab
     /// This is called after the sidebar is dismissed when cacheBackgroundTabs is enabled
     func cacheBackgroundTabScreenshots() async {
-        guard AppConfig.shared.cacheBackgroundTabs else { return }
+        // Both settings must be enabled for caching to run
+        guard AppConfig.shared.cacheBackgroundTabs && AppConfig.shared.showBackgroundTabs else { return }
+
+        // Only run when Winby is in the background (not active)
+        let isActive = await MainActor.run { NSApp.isActive }
+        guard !isActive else {
+            debugLog("cacheBackgroundTabs: Winby is active, skipping")
+            return
+        }
 
         // Prevent concurrent runs
         guard !_isCachingBackgroundTabs else {
@@ -2643,6 +2667,9 @@ struct SettingsView: View {
                 Toggle("Launch at Login", isOn: $config.launchAtLogin)
                 Toggle("Show Background Tabs", isOn: $config.showBackgroundTabs)
                     .help("Show non-active tabs as separate entries in the window list")
+            }
+
+            Section("Experiments") {
                 Toggle("Cache Background Tabs", isOn: $config.cacheBackgroundTabs)
                     .help("Cycle through tabs after dismissal to capture screenshots (causes brief flickering)")
                     .disabled(!config.showBackgroundTabs)
@@ -2670,6 +2697,7 @@ enum OnboardingStep: Int, CaseIterable {
 struct OnboardingView: View {
     @ObservedObject var config = AppConfig.shared
     @State private var currentStep: OnboardingStep = .welcome
+    @State private var furthestStep: OnboardingStep = .welcome  // Track furthest step to prevent auto-forward after Back
     @State private var permissionCheckTimer: Timer?
 
     var body: some View {
@@ -2686,12 +2714,10 @@ struct OnboardingView: View {
                     }
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity)
             .animation(.easeInOut(duration: 0.3), value: currentStep)
 
-            Spacer()
-
-            // Progress dots
+            // Progress dots - fixed at bottom
             HStack(spacing: 8) {
                 ForEach(OnboardingStep.allCases, id: \.rawValue) { step in
                     Circle()
@@ -2699,9 +2725,9 @@ struct OnboardingView: View {
                         .frame(width: 8, height: 8)
                 }
             }
-            .padding(.bottom, 24)
+            .padding(.vertical, 20)
         }
-        .frame(width: 480, height: 520)
+        .frame(width: 480, height: 560)
         .onAppear {
             startPermissionPolling()
         }
@@ -2750,7 +2776,7 @@ struct OnboardingView: View {
 
             Spacer()
 
-            Button(action: { currentStep = .accessibility }) {
+            Button(action: { advanceTo(.accessibility) }) {
                 Text("Get Started")
                     .frame(width: 200)
             }
@@ -2792,7 +2818,7 @@ struct OnboardingView: View {
             Spacer()
 
             if config.hasAccessibilityPermission {
-                Button(action: { currentStep = .screenRecording }) {
+                Button(action: { advanceTo(.screenRecording) }) {
                     Text("Continue")
                         .frame(width: 200)
                 }
@@ -2846,7 +2872,7 @@ struct OnboardingView: View {
             Spacer()
 
             if config.hasScreenRecordingPermission {
-                Button(action: { currentStep = .hotkey }) {
+                Button(action: { advanceTo(.hotkey) }) {
                     Text("Continue")
                         .frame(width: 200)
                 }
@@ -2896,8 +2922,14 @@ struct OnboardingView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 340)
 
+            // Wrap recorder with tap gesture to clear shortcut when clicked
+            // This makes it easier to change an existing shortcut
             KeyboardShortcuts.Recorder("", name: .toggleWinby)
                 .padding(.vertical, 8)
+                .onTapGesture {
+                    // Clear the shortcut so the recorder enters recording mode
+                    KeyboardShortcuts.reset(.toggleWinby)
+                }
 
             Text("Tip: You can use Cmd+Tab, but it requires granting Accessibility permission again after setting it.")
                 .font(.caption)
@@ -2907,7 +2939,7 @@ struct OnboardingView: View {
 
             Spacer()
 
-            Button(action: { currentStep = .launchAtLogin }) {
+            Button(action: { advanceTo(.launchAtLogin) }) {
                 Text("Continue")
                     .frame(width: 200)
             }
@@ -2950,7 +2982,7 @@ struct OnboardingView: View {
 
             Spacer()
 
-            Button(action: { currentStep = .ready }) {
+            Button(action: { advanceTo(.ready) }) {
                 Text("Continue")
                     .frame(width: 200)
             }
@@ -3009,15 +3041,21 @@ struct OnboardingView: View {
 
     func startPermissionPolling() {
         permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
-            // Auto-advance when permissions are granted
-            if currentStep == .accessibility && config.hasAccessibilityPermission {
-                withAnimation {
-                    currentStep = .screenRecording
-                }
-            } else if currentStep == .screenRecording && config.hasScreenRecordingPermission {
-                withAnimation {
-                    currentStep = .hotkey
-                }
+            // Auto-advance when permissions are granted, but only if user hasn't already passed that step
+            // (prevents auto-forwarding when user clicks Back)
+            if currentStep == .accessibility && config.hasAccessibilityPermission && furthestStep.rawValue < OnboardingStep.screenRecording.rawValue {
+                advanceTo(.screenRecording)
+            } else if currentStep == .screenRecording && config.hasScreenRecordingPermission && furthestStep.rawValue < OnboardingStep.hotkey.rawValue {
+                advanceTo(.hotkey)
+            }
+        }
+    }
+
+    func advanceTo(_ step: OnboardingStep) {
+        withAnimation {
+            currentStep = step
+            if step.rawValue > furthestStep.rawValue {
+                furthestStep = step
             }
         }
     }
@@ -3234,12 +3272,14 @@ struct SidebarView: View {
                                 contentSearchTask?.cancel()
                             } else {
                                 triggerContentSearch()
-                                // If current selection is filtered out, select first visible window
-                                if let current = manager.selectedWindowID,
-                                   !filteredWindows.contains(where: { $0.windowID == current }),
-                                   let first = filteredWindows.first {
-                                    manager.selectedWindowID = first.windowID
-                                }
+                            }
+                            // Always ensure we have a valid selection from filtered results
+                            // (handles both filtering out current selection AND other-space only results)
+                            let currentValid = manager.selectedWindowID.flatMap { id in
+                                filteredWindows.contains(where: { $0.windowID == id })
+                            } ?? false
+                            if !currentValid, let first = filteredWindows.first {
+                                manager.selectedWindowID = first.windowID
                             }
                         }
 
@@ -3731,11 +3771,13 @@ struct PreviewPanelView: View {
 // Global reference for CGEventTap callback
 private var globalAppDelegate: AppDelegate?
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var window: NSWindow!
     var previewWindow: NSWindow?
     var statusItem: NSStatusItem?
-    let updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    var statusMenu: NSMenu?
+    // Don't auto-start updater - wait until after onboarding completes
+    let updaterController = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
 
     // Event tap for Cmd+Tab interception
     private var eventTap: CFMachPort?
@@ -3858,7 +3900,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Also add a status bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem?.button?.image = NSImage(systemSymbolName: "square.grid.2x2", accessibilityDescription: "Winby")
-        statusItem?.menu = createMenu()
+        statusMenu = createMenu()
+        statusMenu?.delegate = self
+        statusItem?.menu = statusMenu
 
         // Set up main menu with Edit menu for standard shortcuts
         setupMainMenu()
@@ -3877,6 +3921,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let granted = CGRequestScreenCaptureAccess()
                 debugLog("Screen capture permission granted: \(granted)")
             }
+
+            // Start the updater (we delay it during onboarding)
+            updaterController.startUpdater()
         }
     }
 
@@ -3988,6 +4035,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
+    // MARK: - NSMenuDelegate
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        // Update the hotkey in the first menu item when menu opens
+        if let firstItem = menu.item(at: 0) {
+            firstItem.title = "Show Winby (\(AppConfig.shared.hotkeyDescription))"
+        }
+    }
+
     var settingsWindow: NSWindow?
 
     @objc func showSettings() {
@@ -4051,6 +4107,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // After onboarding, set up the hotkey and other runtime things
         setupGlobalHotkey()
+
+        // Now start the updater (we delayed it to avoid errors during onboarding)
+        updaterController.startUpdater()
     }
 
     @objc func debugDumpContent() {
@@ -4211,9 +4270,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }, completionHandler: {
             self.window.orderOut(nil)
 
-            // Cache background tab screenshots if enabled
+            // Cache background tab screenshots if enabled (requires both settings)
             // Run after a short delay to let the UI settle
-            if AppConfig.shared.cacheBackgroundTabs {
+            if AppConfig.shared.cacheBackgroundTabs && AppConfig.shared.showBackgroundTabs {
                 Task {
                     try? await Task.sleep(nanoseconds: 300_000_000) // 300ms delay
                     await WindowManager.shared.cacheBackgroundTabScreenshots()
