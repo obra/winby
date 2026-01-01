@@ -396,6 +396,9 @@ class WindowManager: ObservableObject {
     /// When a tab is visible, we cache its screenshot here so we can show it when it's backgrounded
     private var _tabScreenshotCache: [String: NSImage] = [:]
 
+    /// Flag to prevent concurrent background tab caching runs
+    private var _isCachingBackgroundTabs: Bool = false
+
     /// Thread-safe tab screenshot cache access
     func getTabScreenshot(key: String) -> NSImage? {
         cacheLock.withLock { _tabScreenshotCache[key] }
@@ -1667,8 +1670,18 @@ class WindowManager: ObservableObject {
             debugLog("thumbnail: cache MISS for '\(cacheKey)' (have \(cacheLock.withLock { _tabScreenshotCache.count }) cached)")
             // Background tabs can't be captured directly - generate placeholder window
             let appIcon = NSRunningApplication(processIdentifier: window.pid)?.icon
-            // Use a reasonable window size for the placeholder (16:10 aspect ratio)
-            let placeholderSize = CGSize(width: maxSize.width, height: maxSize.width * 0.625)
+            // Use parent window's frame (tabs have same size as parent)
+            let parentFrame = windows.first(where: { $0.windowID == window.parentWindowID })?.frame ?? window.frame
+            // Scale to fit maxSize while preserving aspect ratio
+            let aspectRatio = parentFrame.width / parentFrame.height
+            let placeholderSize: CGSize
+            if aspectRatio > maxSize.width / maxSize.height {
+                // Window is wider - constrain by width
+                placeholderSize = CGSize(width: maxSize.width, height: maxSize.width / aspectRatio)
+            } else {
+                // Window is taller - constrain by height
+                placeholderSize = CGSize(width: maxSize.height * aspectRatio, height: maxSize.height)
+            }
             let placeholder = generatePlaceholderWindow(title: window.title, appIcon: appIcon, size: placeholderSize)
             return placeholder
         }
@@ -2025,6 +2038,14 @@ class WindowManager: ObservableObject {
     func cacheBackgroundTabScreenshots() async {
         guard AppConfig.shared.cacheBackgroundTabs else { return }
 
+        // Prevent concurrent runs
+        guard !_isCachingBackgroundTabs else {
+            debugLog("cacheBackgroundTabs: already running, skipping")
+            return
+        }
+        _isCachingBackgroundTabs = true
+        defer { _isCachingBackgroundTabs = false }
+
         debugLog("cacheBackgroundTabs: starting background tab caching")
 
         // Group background tabs by their parent window
@@ -2064,8 +2085,11 @@ class WindowManager: ObservableObject {
             // Find the currently active tab (the one that matches the parent window title)
             let originalActiveIndex = tabs.first { $0.window.title == parentWindow.title }?.index ?? 0
 
+            // Sort tabs by index for consistent processing order
+            let sortedTabs = tabs.sorted { $0.index < $1.index }
+
             // Iterate through each background tab
-            for (tabWindow, tabIndex) in tabs {
+            for (tabWindow, tabIndex) in sortedTabs {
                 debugLog("cacheBackgroundTabs: switching to tab \(tabIndex) '\(tabWindow.title)'")
 
                 // Switch to the tab
@@ -2081,8 +2105,8 @@ class WindowManager: ObservableObject {
                     continue
                 }
 
-                // Wait for the tab to render
-                try? await Task.sleep(nanoseconds: 150_000_000) // 150ms
+                // Wait for the tab to render (250ms seems to work well)
+                try? await Task.sleep(nanoseconds: 250_000_000) // 250ms
 
                 // Capture the screenshot using the parent window ID (now showing this tab)
                 if let cgImage = captureWindowViaPrivateAPI(windowID: parentID, fullSize: true) {
@@ -3670,8 +3694,9 @@ struct PreviewPanelView: View {
             }
             // Background tabs can't be captured - generate placeholder window
             let appIcon = NSRunningApplication(processIdentifier: window.pid)?.icon
-            // Use a larger size for preview panel (16:10 aspect ratio, typical window proportions)
-            let placeholderSize = CGSize(width: 800, height: 500)
+            // Use parent window's actual frame (tabs have same size as parent)
+            let parentFrame = manager.windows.first(where: { $0.windowID == window.parentWindowID })?.frame ?? window.frame
+            let placeholderSize = CGSize(width: parentFrame.width, height: parentFrame.height)
             return manager.generatePlaceholderWindow(title: window.title, appIcon: appIcon, size: placeholderSize)
         }
 
