@@ -3045,21 +3045,16 @@ struct SidebarView: View {
         if trimmedSearch.isEmpty {
             return baseWindows
         }
-        // Fuzzy match and sort by score (including content matches)
+        // Filter by fuzzy match (keep original window order)
         let query = trimmedSearch.lowercased()
-        let scored = baseWindows.compactMap { window -> (WindowInfo, Int)? in
+        return baseWindows.filter { window in
             let titleScore = fuzzyMatch(query: query, in: window.displayTitle.lowercased())
             let appScore = fuzzyMatch(query: query, in: window.appName.lowercased())
             let contentScore = manager.contentMatches[window.windowID] ?? 0
 
             // Window matches if title/app matches OR content matches
-            let titleAppScore = max(titleScore, appScore)
-            if titleAppScore > 0 || contentScore > 0 {
-                return (window, titleAppScore + contentScore)
-            }
-            return nil
+            return max(titleScore, appScore) > 0 || contentScore > 0
         }
-        return scored.sorted { $0.1 > $1.1 }.map { $0.0 }
     }
 
     /// Windows on the current space
@@ -3239,6 +3234,12 @@ struct SidebarView: View {
                                 contentSearchTask?.cancel()
                             } else {
                                 triggerContentSearch()
+                                // If current selection is filtered out, select first visible window
+                                if let current = manager.selectedWindowID,
+                                   !filteredWindows.contains(where: { $0.windowID == current }),
+                                   let first = filteredWindows.first {
+                                    manager.selectedWindowID = first.windowID
+                                }
                             }
                         }
 
