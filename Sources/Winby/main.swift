@@ -40,6 +40,11 @@ class AppConfig: ObservableObject {
         didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
     }
 
+    /// When enabled, background tabs are shown as separate entries in the window list
+    @Published var showBackgroundTabs: Bool {
+        didSet { UserDefaults.standard.set(showBackgroundTabs, forKey: "showBackgroundTabs") }
+    }
+
     /// When enabled, winby will cycle through background tabs after dismissal to cache their screenshots
     /// This causes brief visible tab switching but ensures all tabs have preview images
     @Published var cacheBackgroundTabs: Bool {
@@ -50,6 +55,7 @@ class AppConfig: ObservableObject {
         self.debugMode = UserDefaults.standard.bool(forKey: "debugMode")
         self.launchAtLogin = SMAppService.mainApp.status == .enabled
         self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
+        self.showBackgroundTabs = UserDefaults.standard.bool(forKey: "showBackgroundTabs")
         self.cacheBackgroundTabs = UserDefaults.standard.bool(forKey: "cacheBackgroundTabs")
     }
 
@@ -2635,8 +2641,11 @@ struct SettingsView: View {
 
             Section("General") {
                 Toggle("Launch at Login", isOn: $config.launchAtLogin)
+                Toggle("Show Background Tabs", isOn: $config.showBackgroundTabs)
+                    .help("Show non-active tabs as separate entries in the window list")
                 Toggle("Cache Background Tabs", isOn: $config.cacheBackgroundTabs)
                     .help("Cycle through tabs after dismissal to capture screenshots (causes brief flickering)")
+                    .disabled(!config.showBackgroundTabs)
                 Toggle("Debug Mode", isOn: $config.debugMode)
                     .help("Show debug controls and log to /tmp/wm_debug.log")
             }
@@ -3026,14 +3035,19 @@ struct SidebarView: View {
     @FocusState private var isSearchFocused: Bool
 
     var filteredWindows: [WindowInfo] {
+        // Filter out background tabs if setting is disabled
+        let baseWindows = AppConfig.shared.showBackgroundTabs
+            ? manager.windows
+            : manager.windows.filter { $0.parentWindowID == nil }
+
         // Trim spaces - they're used as term separators, not search characters
         let trimmedSearch = searchText.trimmingCharacters(in: .whitespaces)
         if trimmedSearch.isEmpty {
-            return manager.windows
+            return baseWindows
         }
         // Fuzzy match and sort by score (including content matches)
         let query = trimmedSearch.lowercased()
-        let scored = manager.windows.compactMap { window -> (WindowInfo, Int)? in
+        let scored = baseWindows.compactMap { window -> (WindowInfo, Int)? in
             let titleScore = fuzzyMatch(query: query, in: window.displayTitle.lowercased())
             let appScore = fuzzyMatch(query: query, in: window.appName.lowercased())
             let contentScore = manager.contentMatches[window.windowID] ?? 0
