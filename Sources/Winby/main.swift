@@ -3285,20 +3285,20 @@ struct SidebarView: View {
 
         var fullImage: NSImage?
 
-        // Try ScreenCaptureKit if we have an SCWindow - capture at full resolution
+        // Try ScreenCaptureKit if we have an SCWindow - capture at window's actual size
         if let scWindow = scWindow {
             do {
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let config = SCStreamConfiguration()
-                // Capture at full resolution (2x for retina)
-                let screenSize = NSScreen.main?.frame.size ?? CGSize(width: 1920, height: 1080)
-                config.width = Int(screenSize.width * 2)
-                config.height = Int(screenSize.height * 2)
-                config.scalesToFit = true
+                // Capture at window's actual resolution (2x for retina)
+                let windowSize = scWindow.frame.size
+                config.width = Int(windowSize.width * 2)
+                config.height = Int(windowSize.height * 2)
+                config.scalesToFit = false
                 config.showsCursor = false
 
                 let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                fullImage = NSImage(cgImage: cgImage, size: NSSize(width: CGFloat(cgImage.width) / 2, height: CGFloat(cgImage.height) / 2))
+                fullImage = NSImage(cgImage: cgImage, size: windowSize)
             } catch {
                 // Fall through to private API
             }
@@ -3348,13 +3348,26 @@ struct PreviewPanelView: View {
     @State private var previewImage: NSImage?
     @State private var loadingTask: Task<Void, Never>?
 
+    private let padding: CGFloat = 12
+
     var body: some View {
         ZStack {
             if let image = previewImage {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(padding)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        // Focus the selected window
+                        if let windowID = manager.selectedWindowID {
+                            manager.bringToFront(windowID)
+                            if let appDelegate = NSApp.delegate as? AppDelegate {
+                                appDelegate.didSelectWindow = true
+                                appDelegate.hideSidebar()
+                            }
+                        }
+                    }
             } else {
                 // Show app icon as placeholder while loading
                 if let windowID = manager.selectedWindowID,
@@ -3373,13 +3386,60 @@ struct PreviewPanelView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.8))
         .onChange(of: manager.selectedWindowID) { _, newValue in
             loadPreview(for: newValue)
         }
         .onAppear {
             loadPreview(for: manager.selectedWindowID)
         }
+    }
+
+    private func resizeWindowToFit(_ image: NSImage?) {
+        debugLog("resizeWindowToFit called, image=\(image != nil)")
+        guard let image = image,
+              let appDelegate = NSApp.delegate as? AppDelegate,
+              let window = appDelegate.previewWindow else {
+            debugLog("resizeWindowToFit: guard failed - appDelegate=\(NSApp.delegate != nil), previewWindow=\((NSApp.delegate as? AppDelegate)?.previewWindow != nil)")
+            return
+        }
+
+        let imageSize = image.size
+        debugLog("resizeWindowToFit: imageSize=\(imageSize)")
+        guard imageSize.width > 0 && imageSize.height > 0 else { return }
+
+        // Calculate target size - fit within screen with max dimensions
+        let screen = window.screen ?? NSScreen.main ?? NSScreen.screens.first!
+        let maxWidth = screen.visibleFrame.width * 0.6
+        let maxHeight = screen.visibleFrame.height * 0.7
+
+        let imageAspect = imageSize.width / imageSize.height
+        var targetWidth: CGFloat
+        var targetHeight: CGFloat
+
+        if imageAspect > maxWidth / maxHeight {
+            // Image is wider - constrain by width
+            targetWidth = min(imageSize.width, maxWidth)
+            targetHeight = targetWidth / imageAspect
+        } else {
+            // Image is taller - constrain by height
+            targetHeight = min(imageSize.height, maxHeight)
+            targetWidth = targetHeight * imageAspect
+        }
+
+        // Add padding
+        targetWidth += padding * 2
+        targetHeight += padding * 2
+
+        // Resize window, keeping center position
+        let currentFrame = window.frame
+        let newFrame = NSRect(
+            x: currentFrame.midX - targetWidth / 2,
+            y: currentFrame.midY - targetHeight / 2,
+            width: targetWidth,
+            height: targetHeight
+        )
+        debugLog("resizeWindowToFit: currentFrame=\(currentFrame), newFrame=\(newFrame)")
+        window.setFrame(newFrame, display: true, animate: true)
     }
 
     private func loadPreview(for windowID: UInt32?) {
@@ -3408,6 +3468,7 @@ struct PreviewPanelView: View {
             if !Task.isCancelled {
                 await MainActor.run {
                     previewImage = image  // Will be nil if capture failed
+                    resizeWindowToFit(image)
                 }
             }
         }
@@ -3467,6 +3528,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Local event monitor for catching hotkey when app has focus
     private var localEventMonitor: Any?
+
+    // Global click monitor for dismissing on click outside
+    private var globalClickMonitor: Any?
 
     // Track the previously focused app to restore on dismiss without selection
     private var previouslyFocusedApp: NSRunningApplication?
@@ -3631,16 +3695,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let previewPanel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: previewWidth, height: previewHeight),
-            styleMask: [.titled, .resizable, .nonactivatingPanel, .fullSizeContentView],
+            styleMask: [.borderless, .resizable, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         previewWindow = previewPanel
 
-        previewPanel.title = ""
-        previewPanel.titleVisibility = .hidden
-        previewPanel.titlebarAppearsTransparent = true
         previewPanel.isMovableByWindowBackground = true
+        previewPanel.becomesKeyOnlyIfNeeded = true
+        previewPanel.hidesOnDeactivate = false
         previewPanel.isOpaque = false
         previewPanel.backgroundColor = .clear
         previewPanel.hasShadow = true
@@ -3845,9 +3908,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 preview.animator().alphaValue = 1
             }
         }
+
+        // Add global click monitor to dismiss when clicking outside both windows
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self = self else { return }
+
+            let screenLocation = NSEvent.mouseLocation
+
+            // Check if click is inside sidebar window
+            if self.window.frame.contains(screenLocation) {
+                return
+            }
+
+            // Check if click is inside preview window
+            if let preview = self.previewWindow, preview.frame.contains(screenLocation) {
+                return
+            }
+
+            // Click was outside both windows - dismiss
+            self.hideSidebar()
+        }
     }
 
     func hideSidebar() {
+        // Remove global click monitor
+        if let monitor = globalClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalClickMonitor = nil
+        }
+
         // Clear cycling state
         isTabCycling = false
         WindowManager.shared.isCycling = false
