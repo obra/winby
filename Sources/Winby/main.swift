@@ -373,6 +373,18 @@ class WindowManager: ObservableObject {
         set { cacheLock.withLock { _thumbnailCache = newValue } }
     }
 
+    /// Cached full-size images for preview panel - captured alongside thumbnails
+    private var _fullImageCache: [UInt32: NSImage] = [:]
+    func getFullImage(for windowID: UInt32) -> NSImage? {
+        cacheLock.withLock { _fullImageCache[windowID] }
+    }
+    func setFullImage(for windowID: UInt32, image: NSImage) {
+        cacheLock.withLock { _fullImageCache[windowID] = image }
+    }
+    func clearFullImageCache() {
+        cacheLock.withLock { _fullImageCache.removeAll() }
+    }
+
     /// Tab screenshot cache - keyed by "pid:title" for background tabs
     /// When a tab is visible, we cache its screenshot here so we can show it when it's backgrounded
     private var _tabScreenshotCache: [String: NSImage] = [:]
@@ -400,9 +412,9 @@ class WindowManager: ObservableObject {
     }
 
     /// Helper to generate tab cache key
-    /// Includes tabIndex to differentiate tabs with identical titles
-    func tabCacheKey(pid: pid_t, title: String, tabIndex: Int) -> String {
-        return "\(pid):\(title):\(tabIndex)"
+    /// Uses pid and title only - tabIndex is unreliable between invocations
+    func tabCacheKey(pid: pid_t, title: String) -> String {
+        return "\(pid):\(title)"
     }
 
     /// Cached window content for search (windowID -> content snippet)
@@ -936,7 +948,7 @@ class WindowManager: ObservableObject {
             return nil
         }
 
-        let cacheKey = tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
+        let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
 
         // For background tabs, check tabOcrCache first
         if window.parentWindowID != nil {
@@ -1555,10 +1567,13 @@ class WindowManager: ObservableObject {
 
         // For background tabs, check tab screenshot cache first
         if window.parentWindowID != nil {
-            let cacheKey = tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
+            let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+            debugLog("thumbnail: background tab '\(window.title)' cacheKey='\(cacheKey)'")
             if let cached = getTabScreenshot(key: cacheKey) {
+                debugLog("thumbnail: cache HIT for '\(cacheKey)'")
                 return cached
             }
+            debugLog("thumbnail: cache MISS for '\(cacheKey)' (have \(cacheLock.withLock { _tabScreenshotCache.count }) cached)")
             // Background tabs can't be captured directly - fall back to app icon
             if let app = NSRunningApplication(processIdentifier: window.pid),
                let icon = app.icon {
@@ -1586,7 +1601,8 @@ class WindowManager: ObservableObject {
                 thumbnailCache[windowID] = nsImage
 
                 // Cache full resolution version for background tab use
-                let cacheKey = tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
+                let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+                debugLog("thumbnail: caching screenshot for '\(window.title)' cacheKey='\(cacheKey)'")
                 let fullResConfig = SCStreamConfiguration()
                 fullResConfig.width = Int(scWindow.frame.width * 2)  // Retina
                 fullResConfig.height = Int(scWindow.frame.height * 2)
@@ -1595,6 +1611,7 @@ class WindowManager: ObservableObject {
                 if let fullResImage = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: fullResConfig) {
                     let fullResNsImage = NSImage(cgImage: fullResImage, size: scWindow.frame.size)
                     setTabScreenshot(key: cacheKey, image: fullResNsImage)
+                    debugLog("thumbnail: cached screenshot for '\(cacheKey)' (now have \(cacheLock.withLock { _tabScreenshotCache.count }) cached)")
                 }
 
                 return nsImage
@@ -1699,7 +1716,7 @@ class WindowManager: ObservableObject {
 
     /// Direct AX-based tab switching - clicks tab radio buttons directly via Accessibility API
     /// Returns true if successful
-    private func selectTabViaAX(pid: pid_t, tabIndex: Int) -> Bool {
+    private func selectTabViaAX(pid: pid_t, tabIndex: Int, tabTitle: String? = nil) -> Bool {
         let appElement = AXUIElementCreateApplication(pid)
 
         // Get windows
@@ -1746,31 +1763,58 @@ class WindowManager: ObservableObject {
             return false
         }
 
-        // Filter to radio buttons only
-        var radioButtons: [AXUIElement] = []
+        // Filter to radio buttons only and collect with titles
+        var radioButtons: [(element: AXUIElement, title: String)] = []
         for child in children {
             var roleRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleRef) == .success,
                let role = roleRef as? String, role == "AXRadioButton" {
-                radioButtons.append(child)
+                var titleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXTitleAttribute as CFString, &titleRef)
+                let title = titleRef as? String ?? ""
+                radioButtons.append((child, title))
             }
         }
 
-        guard tabIndex < radioButtons.count else {
-            print("[Winby] AX tab switch: index \(tabIndex) out of range (have \(radioButtons.count) tabs)")
+        // Find target tab - prefer title match, fall back to index
+        var targetTab: AXUIElement?
+        var matchedTitle = ""
+
+        if let tabTitle = tabTitle {
+            // Try exact match first
+            for (element, title) in radioButtons {
+                if title == tabTitle {
+                    targetTab = element
+                    matchedTitle = title
+                    break
+                }
+            }
+            // Try contains match if no exact match
+            if targetTab == nil {
+                for (element, title) in radioButtons {
+                    if title.contains(tabTitle) || tabTitle.contains(title) {
+                        targetTab = element
+                        matchedTitle = title
+                        break
+                    }
+                }
+            }
+        }
+
+        // Fall back to index if title match failed
+        if targetTab == nil && tabIndex < radioButtons.count {
+            targetTab = radioButtons[tabIndex].element
+            matchedTitle = radioButtons[tabIndex].title
+        }
+
+        guard let tab = targetTab else {
+            print("[Winby] AX tab switch: could not find tab '\(tabTitle ?? "index \(tabIndex)")' (have \(radioButtons.count) tabs: \(radioButtons.map { $0.title }))")
             return false
         }
 
-        let targetTab = radioButtons[tabIndex]
-
-        // Get title for logging
-        var titleRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(targetTab, kAXTitleAttribute as CFString, &titleRef)
-        let title = titleRef as? String ?? "unknown"
-
         // Click it
-        let result = AXUIElementPerformAction(targetTab, kAXPressAction as CFString)
-        print("[Winby] AX tab switch: clicked tab \(tabIndex) '\(title)' - result: \(result.rawValue)")
+        let result = AXUIElementPerformAction(tab, kAXPressAction as CFString)
+        print("[Winby] AX tab switch: clicked '\(matchedTitle)' - result: \(result.rawValue)")
         return result == .success
     }
 
@@ -1779,10 +1823,10 @@ class WindowManager: ObservableObject {
     private func selectTabViaAppleScript(appName: String, pid: pid_t, tabTitle: String, tabIndex: Int) -> Bool {
         let bundleId = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
 
-        // For Terminal.app, use direct AX approach (AppleScript doesn't work reliably from Swift)
-        if bundleId == "com.apple.Terminal" {
-            print("[Winby] Terminal detected, using direct AX tab switch")
-            return selectTabViaAX(pid: pid, tabIndex: tabIndex)
+        // For Terminal.app and Ghostty, use direct AX approach (AppleScript doesn't work reliably from Swift)
+        if bundleId == "com.apple.Terminal" || bundleId == "com.mitchellh.ghostty" {
+            print("[Winby] \(appName) detected, using direct AX tab switch for '\(tabTitle)'")
+            return selectTabViaAX(pid: pid, tabIndex: tabIndex, tabTitle: tabTitle)
         }
 
         let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
@@ -1857,7 +1901,7 @@ class WindowManager: ObservableObject {
                             if \(targetIndex) ≤ tabCount then
                                 set t to radio button \(targetIndex) of tg
                                 click t
-                                return "clicked by index " & \(targetIndex) & ": " & (title of t)
+                                return "clicked"
                             end if
 
                             return "index \(targetIndex) out of range, only " & tabCount & " tabs"
@@ -2203,20 +2247,23 @@ class WindowManager: ObservableObject {
             return
         }
 
-        debugLog("focusWindow: \(window.appName) '\(window.title)' isOnCurrentSpace=\(window.isOnCurrentSpace) parentWindowID=\(window.parentWindowID?.description ?? "nil")")
+        debugLog("focusWindow: \(window.appName) '\(window.title)' isOnCurrentSpace=\(window.isOnCurrentSpace) parentWindowID=\(window.parentWindowID?.description ?? "nil") tabIndex=\(window.tabIndex)")
 
         let targetWindowID = window.parentWindowID ?? windowID
 
         // Handle background tabs first - switch to the correct tab
-        if window.parentWindowID != nil {
-            debugLog("focusWindow: this is a background tab, trying to switch")
+        let isBackgroundTab = window.parentWindowID != nil
+        if isBackgroundTab {
+            debugLog("focusWindow: this is a background tab (index \(window.tabIndex)), trying to switch")
             // Try AppleScript first (more reliable for Terminal, Safari, etc.)
-            if !selectTabViaAppleScript(
+            let tabSwitchResult = selectTabViaAppleScript(
                 appName: window.appName,
                 pid: window.pid,
                 tabTitle: window.title,
                 tabIndex: window.tabIndex
-            ) {
+            )
+            debugLog("focusWindow: tab switch via AppleScript returned \(tabSwitchResult)")
+            if !tabSwitchResult {
                 // Fall back to AX approach if AppleScript didn't work
                 debugLog("focusWindow: AppleScript failed, trying AX fallback")
                 let appElement = AXUIElementCreateApplication(window.pid)
@@ -2229,6 +2276,13 @@ class WindowManager: ObservableObject {
                         }
                     }
                 }
+            }
+
+            // For background tabs on current space, the tab click already focused the window.
+            // Skip the full window activation sequence which can revert the tab selection.
+            if window.isOnCurrentSpace {
+                debugLog("focusWindow: background tab on current space, skipping window activation (tab click handled it)")
+                return
             }
         }
 
@@ -3213,10 +3267,11 @@ struct SidebarView: View {
     }
 
     /// Capture a single thumbnail using provided SCWindow (avoids repeated SCShareableContent calls)
+    /// Also caches the full-size image for instant preview loading
     func captureThumbnail(window: WindowInfo, scWindow: SCWindow?, maxSize: CGSize) async -> NSImage? {
         // For background tabs, check tab screenshot cache first
         if window.parentWindowID != nil {
-            let cacheKey = manager.tabCacheKey(pid: window.pid, title: window.title, tabIndex: window.tabIndex)
+            let cacheKey = manager.tabCacheKey(pid: window.pid, title: window.title)
             if let cached = manager.getTabScreenshot(key: cacheKey) {
                 return cached
             }
@@ -3228,36 +3283,52 @@ struct SidebarView: View {
             return nil
         }
 
-        // Try ScreenCaptureKit if we have an SCWindow
+        var fullImage: NSImage?
+
+        // Try ScreenCaptureKit if we have an SCWindow - capture at full resolution
         if let scWindow = scWindow {
             do {
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let config = SCStreamConfiguration()
-                config.width = Int(maxSize.width * 2)
-                config.height = Int(maxSize.height * 2)
+                // Capture at full resolution (2x for retina)
+                let screenSize = NSScreen.main?.frame.size ?? CGSize(width: 1920, height: 1080)
+                config.width = Int(screenSize.width * 2)
+                config.height = Int(screenSize.height * 2)
                 config.scalesToFit = true
                 config.showsCursor = false
 
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                return NSImage(cgImage: image, size: maxSize)
+                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                fullImage = NSImage(cgImage: cgImage, size: NSSize(width: CGFloat(cgImage.width) / 2, height: CGFloat(cgImage.height) / 2))
             } catch {
                 // Fall through to private API
             }
         }
 
-        // Fallback: try private API
-        if let cgImage = manager.captureWindowViaPrivateAPI(windowID: window.windowID, fullSize: false) {
-            let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
-            let nsImage = NSImage(cgImage: cgImage, size: size)
+        // Fallback: try private API at full size
+        if fullImage == nil {
+            if let cgImage = manager.captureWindowViaPrivateAPI(windowID: window.windowID, fullSize: true) {
+                let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+                fullImage = NSImage(cgImage: cgImage, size: size)
+            }
+        }
 
-            let scale = min(maxSize.width / size.width, maxSize.height / size.height)
-            let scaledSize = CGSize(width: size.width * scale, height: size.height * scale)
-            let scaledImage = NSImage(size: scaledSize)
-            scaledImage.lockFocus()
-            nsImage.draw(in: NSRect(origin: .zero, size: scaledSize))
-            scaledImage.unlockFocus()
+        // Cache full image for preview panel and tab screenshot cache
+        if let fullImage = fullImage {
+            manager.setFullImage(for: window.windowID, image: fullImage)
 
-            return scaledImage
+            // Also cache in tab screenshot cache for when this becomes a background tab
+            let cacheKey = manager.tabCacheKey(pid: window.pid, title: window.title)
+            manager.setTabScreenshot(key: cacheKey, image: fullImage)
+
+            // Create thumbnail from full image
+            let fullSize = fullImage.size
+            let scale = min(maxSize.width / fullSize.width, maxSize.height / fullSize.height)
+            let scaledSize = CGSize(width: fullSize.width * scale, height: fullSize.height * scale)
+            let thumbnail = NSImage(size: scaledSize)
+            thumbnail.lockFocus()
+            fullImage.draw(in: NSRect(origin: .zero, size: scaledSize))
+            thumbnail.unlockFocus()
+            return thumbnail
         }
 
         // Final fallback: app icon
@@ -3320,48 +3391,53 @@ struct PreviewPanelView: View {
             return
         }
 
+        // Clear immediately if we don't have a cached image
+        // This prevents showing stale preview for windows without screenshots
+        // Check both fullImageCache and tabScreenshotCache
+        var hasCachedImage = manager.getFullImage(for: windowID) != nil
+        if !hasCachedImage, let window = manager.windows.first(where: { $0.windowID == windowID }) {
+            let cacheKey = manager.tabCacheKey(pid: window.pid, title: window.title)
+            hasCachedImage = manager.getTabScreenshot(key: cacheKey) != nil
+        }
+        if !hasCachedImage {
+            previewImage = nil
+        }
+
         loadingTask = Task {
-            // Capture at full resolution (up to screen size)
-            if let image = await captureWindowImage(windowID: windowID) {
-                if !Task.isCancelled {
-                    await MainActor.run {
-                        previewImage = image
-                    }
+            let image = await captureWindowImage(windowID: windowID)
+            if !Task.isCancelled {
+                await MainActor.run {
+                    previewImage = image  // Will be nil if capture failed
                 }
             }
         }
     }
 
     private func captureWindowImage(windowID: UInt32) async -> NSImage? {
-        // Get screen size for max capture dimensions
-        let screenSize = NSScreen.main?.frame.size ?? CGSize(width: 1920, height: 1080)
+        // Check full image cache first - populated during thumbnail loading
+        if let cached = manager.getFullImage(for: windowID) {
+            return cached
+        }
 
-        // Try ScreenCaptureKit first (works for most on-screen windows)
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            if let scWindow = content.windows.first(where: { $0.windowID == windowID }) {
-                let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-                let config = SCStreamConfiguration()
-                // Capture at up to 2x screen resolution for retina quality
-                config.width = Int(screenSize.width * 2)
-                config.height = Int(screenSize.height * 2)
-                config.scalesToFit = true
-                config.showsCursor = false
-
-                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                return NSImage(cgImage: cgImage, size: NSSize(width: CGFloat(cgImage.width) / 2, height: CGFloat(cgImage.height) / 2))
+        // For background tabs, check tab screenshot cache
+        if let window = manager.windows.first(where: { $0.windowID == windowID }),
+           window.parentWindowID != nil {
+            let cacheKey = manager.tabCacheKey(pid: window.pid, title: window.title)
+            if let cached = manager.getTabScreenshot(key: cacheKey) {
+                return cached
             }
-        } catch {
-            debugLog("Preview capture failed: \(error)")
+            // Background tabs can't be captured - no fallback
+            return nil
         }
 
-        // Fallback: try private API (works for minimized/other-space windows)
+        // Try private API - it's fast and works for most windows
         if let cgImage = manager.captureWindowViaPrivateAPI(windowID: windowID, fullSize: true) {
-            return NSImage(cgImage: cgImage, size: NSSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height)))
+            let image = NSImage(cgImage: cgImage, size: NSSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height)))
+            manager.setFullImage(for: windowID, image: image)
+            return image
         }
 
-        // Final fallback: try to get from thumbnail cache
-        return await manager.thumbnail(for: windowID, maxSize: CGSize(width: 800, height: 600))
+        return nil
     }
 }
 
