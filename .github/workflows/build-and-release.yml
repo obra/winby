@@ -174,7 +174,7 @@ jobs:
             <key>SUFeedURL</key>
             <string>https://github.com/obra/winby/releases/latest/download/appcast.xml</string>
             <key>SUPublicEDKey</key>
-            <string>\${{ secrets.SPARKLE_PUBLIC_KEY }}</string>
+            <string>${{ secrets.SPARKLE_PUBLIC_KEY }}</string>
         </dict>
         </plist>
         EOF
