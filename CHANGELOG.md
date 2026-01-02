@@ -2,6 +2,21 @@
 
 All notable changes to Winby will be documented in this file.
 
+## [1.2.0] - 2026-01-01
+
+### Added
+- Corner resize handle on preview panel (appears on hover, maintains aspect ratio)
+- Smooth 0.25s crossfade animation when switching between window previews
+
+### Fixed
+- Filter out phantom/zombie windows from "Other Spaces" section
+- Preview panel now sizes exactly to screenshot (no letterboxing or empty space)
+
+### Changed
+- Preview panel has no background/border - just the screenshot with drop shadow
+- Drag screenshot to move preview, drag corner handle to resize
+- Moved "Cache Background Tabs" to Experiments section in settings
+
 ## [1.1.1] - 2025-01-01
 
 ### Fixed
