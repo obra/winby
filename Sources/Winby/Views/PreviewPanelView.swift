@@ -174,14 +174,25 @@ struct PreviewPanelView: View {
     }
 
     private func captureWindowImage(windowID: UInt32) async -> NSImage? {
+        // Get window info for checks
+        guard let window = manager.windows.first(where: { $0.windowID == windowID }) else {
+            return nil
+        }
+
+        // For sensitive apps (password managers), generate a placeholder instead of real screenshot
+        if manager.isSensitiveApp(pid: window.pid, appName: window.appName) {
+            let appIcon = NSRunningApplication(processIdentifier: window.pid)?.icon
+            let placeholderSize = CGSize(width: window.frame.width, height: window.frame.height)
+            return manager.generatePlaceholderWindow(title: window.title, appIcon: appIcon, size: placeholderSize)
+        }
+
         // Check full image cache first - populated during thumbnail loading
         if let cached = manager.getFullImage(for: windowID) {
             return cached
         }
 
         // For background tabs, check tab screenshot cache
-        if let window = manager.windows.first(where: { $0.windowID == windowID }),
-           window.parentWindowID != nil {
+        if window.parentWindowID != nil {
             let cacheKey = manager.tabCacheKey(pid: window.pid, title: window.title)
             if let cached = manager.getTabScreenshot(key: cacheKey) {
                 return cached

@@ -115,8 +115,8 @@ class WindowManager: ObservableObject {
         }
     }
 
-    // Apps to exclude from the window list
-    private static let excludedApps: Set<String> = [
+    // Apps to completely hide from the window list (system UI, etc.)
+    private static let hiddenApps: Set<String> = [
         "Autofill",
         "AutoFillAgent",
         "SystemUIServer",
@@ -125,14 +125,40 @@ class WindowManager: ObservableObject {
         "Dock",
         "Spotlight",
         "Alfred",  // Alfred's window is usually just for search
-        "1Password",
-        "Bitwarden",
-        "Keychain Access",
         "AnySign",
         "universalAccessAuthWarn",
         "com.apple.WebKit.WebContent",
         "loginwindow",
     ]
+
+    // Apps to show but NOT screenshot (sensitive content like password managers)
+    private static let sensitiveAppNames: Set<String> = [
+        "1Password",
+        "Bitwarden",
+        "Keychain Access",
+        "Passwords",
+    ]
+
+    // Bundle IDs for sensitive apps (more reliable than names)
+    private static let sensitiveBundleIDs: Set<String> = [
+        "com.1password.1password",
+        "com.agilebits.onepassword7",  // Older 1Password
+        "com.bitwarden.desktop",
+        "com.apple.keychainaccess",
+        "com.apple.Passwords",
+    ]
+
+    /// Check if a window belongs to a sensitive app that should not be screenshotted
+    func isSensitiveApp(pid: pid_t, appName: String) -> Bool {
+        if Self.sensitiveAppNames.contains(appName) {
+            return true
+        }
+        if let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
+           Self.sensitiveBundleIDs.contains(bundleID) {
+            return true
+        }
+        return false
+    }
 
     func refresh() {
         // Reset synthetic ID counter for this refresh cycle
@@ -193,7 +219,7 @@ class WindowManager: ObservableObject {
             if pid == myPID { continue }
 
             let appName = app.localizedName ?? "Unknown"
-            if Self.excludedApps.contains(appName) { continue }
+            if Self.hiddenApps.contains(appName) { continue }
 
             // Cache the app icon once per app (avoid repeated lookups)
             let appIcon = app.icon
@@ -410,7 +436,7 @@ class WindowManager: ObservableObject {
             if cgInfo.pid == myPID { continue }
 
             // Skip excluded apps
-            if Self.excludedApps.contains(cgInfo.appName) { continue }
+            if Self.hiddenApps.contains(cgInfo.appName) { continue }
 
             // Get app icon for this PID
             let otherSpaceAppIcon = NSRunningApplication(processIdentifier: cgInfo.pid)?.icon

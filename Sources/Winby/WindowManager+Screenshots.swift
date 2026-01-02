@@ -116,6 +116,20 @@ extension WindowManager {
             return thumbnailCache[windowID]
         }
 
+        // For sensitive apps (password managers), generate a placeholder instead of real screenshot
+        if isSensitiveApp(pid: window.pid, appName: window.appName) {
+            debugLog("thumbnail: sensitive app '\(window.appName)', generating placeholder")
+            let appIcon = NSRunningApplication(processIdentifier: window.pid)?.icon
+            let aspectRatio = window.frame.width / window.frame.height
+            let placeholderSize: CGSize
+            if aspectRatio > maxSize.width / maxSize.height {
+                placeholderSize = CGSize(width: maxSize.width, height: maxSize.width / aspectRatio)
+            } else {
+                placeholderSize = CGSize(width: maxSize.height * aspectRatio, height: maxSize.height)
+            }
+            return generatePlaceholderWindow(title: window.title, appIcon: appIcon, size: placeholderSize)
+        }
+
         // For background tabs, check tab screenshot cache first
         if window.parentWindowID != nil {
             let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
