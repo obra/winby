@@ -1,0 +1,2221 @@
+import Cocoa
+import SwiftUI
+import ScreenCaptureKit
+import Vision
+
+// MARK: - Window Manager
+
+class WindowManager: ObservableObject {
+    static let shared = WindowManager()
+
+    @Published var windows: [WindowInfo] = []
+    @Published var selectedWindowID: UInt32? = nil
+    @Published var sidebarResetTrigger: Bool = false  // Toggle to reset sidebar state
+
+    private let cid: Int32
+    private var refreshTimer: Timer?
+    var isCycling = false  // When true, don't reorder windows during refresh
+    var sidebarVisible = false  // When true, preserve window order during refresh
+
+    /// Lock for thread-safe cache access
+    private let cacheLock = NSLock()
+
+    /// Cached thumbnails - kept even when windows go to background
+    private var _thumbnailCache: [UInt32: NSImage] = [:]
+    var thumbnailCache: [UInt32: NSImage] {
+        get { cacheLock.withLock { _thumbnailCache } }
+        set { cacheLock.withLock { _thumbnailCache = newValue } }
+    }
+
+    /// Cached full-size images for preview panel - captured alongside thumbnails
+    private var _fullImageCache: [UInt32: NSImage] = [:]
+    func getFullImage(for windowID: UInt32) -> NSImage? {
+        cacheLock.withLock { _fullImageCache[windowID] }
+    }
+    func setFullImage(for windowID: UInt32, image: NSImage) {
+        cacheLock.withLock { _fullImageCache[windowID] = image }
+    }
+    func clearFullImageCache() {
+        cacheLock.withLock { _fullImageCache.removeAll() }
+    }
+
+    /// Tab screenshot cache - keyed by "pid:title" for background tabs
+    /// When a tab is visible, we cache its screenshot here so we can show it when it's backgrounded
+    private var _tabScreenshotCache: [String: NSImage] = [:]
+
+    /// Flag to prevent concurrent background tab caching runs
+    private var _isCachingBackgroundTabs: Bool = false
+
+    /// Thread-safe tab screenshot cache access
+    func getTabScreenshot(key: String) -> NSImage? {
+        cacheLock.withLock { _tabScreenshotCache[key] }
+    }
+
+    func setTabScreenshot(key: String, image: NSImage) {
+        cacheLock.withLock { _tabScreenshotCache[key] = image }
+    }
+
+    /// Tab OCR cache - keyed by "pid:title" for background tabs
+    /// When a tab is visible, we cache its OCR text here for search when it's backgrounded
+    private var _tabOcrCache: [String: String] = [:]
+
+    /// Thread-safe tab OCR cache access
+    func getTabOcr(key: String) -> String? {
+        cacheLock.withLock { _tabOcrCache[key] }
+    }
+
+    func setTabOcr(key: String, text: String) {
+        cacheLock.withLock { _tabOcrCache[key] = text }
+    }
+
+    /// Helper to generate tab cache key
+    /// Uses pid and title only - tabIndex is unreliable between invocations
+    func tabCacheKey(pid: pid_t, title: String) -> String {
+        return "\(pid):\(title)"
+    }
+
+    /// Cached window content for search (windowID -> content snippet)
+    private var _contentCache: [UInt32: String] = [:]
+    var contentCache: [UInt32: String] {
+        get { cacheLock.withLock { _contentCache } }
+        set { cacheLock.withLock { _contentCache = newValue } }
+    }
+
+    /// Windows we've already tried and failed to get content from (don't retry)
+    private var _contentFailed: Set<UInt32> = []
+    var contentFailed: Set<UInt32> {
+        get { cacheLock.withLock { _contentFailed } }
+        set { cacheLock.withLock { _contentFailed = newValue } }
+    }
+
+    /// Screenshot hashes for change detection (windowID -> hash)
+    private var _screenshotHashes: [UInt32: Int] = [:]
+    var screenshotHashes: [UInt32: Int] {
+        get { cacheLock.withLock { _screenshotHashes } }
+        set { cacheLock.withLock { _screenshotHashes = newValue } }
+    }
+
+    /// Content search results (windowID -> match score)
+    @Published var contentMatches: [UInt32: Int] = [:]
+
+    /// Counter for generating synthetic window IDs for tabs without CGWindowID
+    private var syntheticIDCounter: UInt32 = UInt32.max - 1_000_000
+
+
+    init() {
+        cid = SLSMainConnectionID()
+        refresh()
+
+        // Refresh window list periodically
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    // Apps to exclude from the window list
+    private static let excludedApps: Set<String> = [
+        "Autofill",
+        "AutoFillAgent",
+        "SystemUIServer",
+        "ControlCenter",
+        "NotificationCenter",
+        "Dock",
+        "Spotlight",
+        "Alfred",  // Alfred's window is usually just for search
+        "1Password",
+        "Bitwarden",
+        "Keychain Access",
+        "AnySign",
+        "universalAccessAuthWarn",
+        "com.apple.WebKit.WebContent",
+        "loginwindow",
+    ]
+
+    /// Debug: dump AX hierarchy to find tab structure
+    private func dumpAXHierarchy(_ element: AXUIElement, depth: Int = 0, maxDepth: Int = 3) {
+        guard depth < maxDepth else { return }
+        let indent = String(repeating: "  ", count: depth)
+
+        var roleRef: CFTypeRef?
+        var role = "unknown"
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success {
+            role = roleRef as? String ?? "unknown"
+        }
+
+        var titleRef: CFTypeRef?
+        var title = ""
+        if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef) == .success {
+            title = titleRef as? String ?? ""
+        }
+
+        var descRef: CFTypeRef?
+        var desc = ""
+        if AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef) == .success {
+            desc = descRef as? String ?? ""
+        }
+
+        debugLog("\(indent)[\(role)] title='\(title)' desc='\(desc)'")
+
+        // Get children
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            for child in children {
+                dumpAXHierarchy(child, depth: depth + 1, maxDepth: maxDepth)
+            }
+        }
+    }
+
+    /// Get tab titles from a window's tab group
+    /// Returns (tab titles, index of selected tab) - selectedIndex is -1 if unknown
+    private func getTabTitles(from window: AXUIElement) -> (titles: [String], selectedIndex: Int) {
+        var tabs: [String] = []
+        var selectedIndex: Int = -1
+
+        // Look for AXTabGroup in children
+        func findTabs(in element: AXUIElement, depth: Int = 0) {
+            guard depth < 5 else { return }
+
+            var roleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+               let role = roleRef as? String {
+
+                // Found a tab group - get its tabs
+                if role == "AXTabGroup" {
+                    // First try kAXTabsAttribute (standard tabs)
+                    var tabsRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(element, kAXTabsAttribute as CFString, &tabsRef) == .success,
+                       let tabElements = tabsRef as? [AXUIElement] {
+                        for (index, tab) in tabElements.enumerated() {
+                            var titleRef: CFTypeRef?
+                            if AXUIElementCopyAttributeValue(tab, kAXTitleAttribute as CFString, &titleRef) == .success,
+                               let title = titleRef as? String, !title.isEmpty {
+                                tabs.append(title)
+
+                                // Check if this tab is selected (via value attribute = 1)
+                                var valueRef: CFTypeRef?
+                                if AXUIElementCopyAttributeValue(tab, kAXValueAttribute as CFString, &valueRef) == .success,
+                                   let value = valueRef as? Int, value == 1 {
+                                    selectedIndex = index
+                                }
+                            }
+                        }
+                    }
+                    // If no tabs found, check for radio buttons (Terminal.app uses this)
+                    if tabs.isEmpty {
+                        var childrenRef: CFTypeRef?
+                        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+                           let children = childrenRef as? [AXUIElement] {
+                            for (index, child) in children.enumerated() {
+                                var childRoleRef: CFTypeRef?
+                                if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &childRoleRef) == .success,
+                                   let childRole = childRoleRef as? String,
+                                   childRole == "AXRadioButton" {
+                                    var titleRef: CFTypeRef?
+                                    if AXUIElementCopyAttributeValue(child, kAXTitleAttribute as CFString, &titleRef) == .success,
+                                       let title = titleRef as? String, !title.isEmpty {
+                                        tabs.append(title)
+
+                                        // Check if selected
+                                        var valueRef: CFTypeRef?
+                                        if AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &valueRef) == .success,
+                                           let value = valueRef as? Int, value == 1 {
+                                            selectedIndex = index
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return
+                }
+
+                // Also check for radio groups (sometimes used for tabs)
+                if role == "AXRadioGroup" {
+                    var childrenRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+                       let children = childrenRef as? [AXUIElement] {
+                        for (index, child) in children.enumerated() {
+                            var childRoleRef: CFTypeRef?
+                            if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &childRoleRef) == .success,
+                               let childRole = childRoleRef as? String,
+                               childRole == "AXRadioButton" {
+                                var titleRef: CFTypeRef?
+                                if AXUIElementCopyAttributeValue(child, kAXTitleAttribute as CFString, &titleRef) == .success,
+                                   let title = titleRef as? String, !title.isEmpty {
+                                    tabs.append(title)
+
+                                    // Check if this radio button is selected
+                                    var valueRef: CFTypeRef?
+                                    if AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &valueRef) == .success,
+                                       let value = valueRef as? Int, value == 1 {
+                                        selectedIndex = index
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return
+                }
+            }
+
+            // Recurse into children
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                for child in children {
+                    findTabs(in: child, depth: depth + 1)
+                }
+            }
+        }
+
+        findTabs(in: window)
+        return (tabs, selectedIndex)
+    }
+
+    /// Get browser tabs via AppleScript (Safari, Chrome, Arc have native scripting support)
+    /// Returns (tabTitles, selectedIndex) or nil if not a supported browser
+    private func getBrowserTabs(bundleId: String, appName: String) -> (titles: [String], selectedIndex: Int)? {
+        var script: String?
+
+        if bundleId == "com.apple.Safari" || appName == "Safari" {
+            script = """
+            tell application "Safari"
+                set tabInfo to {}
+                set selectedIdx to -1
+                repeat with w in windows
+                    set tabCount to count of tabs of w
+                    set currentTab to current tab of w
+                    repeat with i from 1 to tabCount
+                        set t to tab i of w
+                        set tabName to name of t
+                        set end of tabInfo to tabName
+                        if t is currentTab then
+                            set selectedIdx to (i - 1)
+                        end if
+                    end repeat
+                    -- Only process first window
+                    exit repeat
+                end repeat
+                return {tabInfo, selectedIdx}
+            end tell
+            """
+        } else if bundleId == "com.google.Chrome" || appName.contains("Chrome") {
+            script = """
+            tell application "Google Chrome"
+                set tabInfo to {}
+                set selectedIdx to -1
+                repeat with w in windows
+                    set tabCount to count of tabs of w
+                    set activeIdx to active tab index of w
+                    repeat with i from 1 to tabCount
+                        set tabTitle to title of tab i of w
+                        set end of tabInfo to tabTitle
+                    end repeat
+                    set selectedIdx to (activeIdx - 1)
+                    exit repeat
+                end repeat
+                return {tabInfo, selectedIdx}
+            end tell
+            """
+        }
+
+        guard let scriptSource = script else { return nil }
+
+        var error: NSDictionary?
+        guard let appleScript = NSAppleScript(source: scriptSource) else { return nil }
+
+        let result = appleScript.executeAndReturnError(&error)
+        if error != nil { return nil }
+
+        // Parse result - it's a list containing {tabTitles, selectedIndex}
+        guard result.numberOfItems >= 2 else { return nil }
+
+        let tabListDesc = result.atIndex(1)
+        let selectedIdxDesc = result.atIndex(2)
+
+        var titles: [String] = []
+        if let tabList = tabListDesc {
+            for i in 1...tabList.numberOfItems {
+                if let item = tabList.atIndex(i), let title = item.stringValue {
+                    titles.append(title)
+                }
+            }
+        }
+
+        let selectedIdx = selectedIdxDesc?.int32Value ?? -1
+        return (titles, Int(selectedIdx))
+    }
+
+    /// Enable accessibility for Electron/Chrome apps that require it
+    private func enableAppAccessibility(pid: pid_t) {
+        let appElement = AXUIElementCreateApplication(pid)
+        // Enable for Electron apps
+        AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, true as CFTypeRef)
+        // Enable for Chrome-based apps
+        AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, true as CFTypeRef)
+    }
+
+    /// Try to get text from an element using multiple attribute approaches
+    private func getTextFromElement(_ element: AXUIElement) -> String? {
+        // Try AXValue first (most common)
+        var valueRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
+           let text = valueRef as? String, !text.isEmpty {
+            return text
+        }
+
+        // Try AXTitle
+        var titleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef) == .success,
+           let text = titleRef as? String, !text.isEmpty {
+            return text
+        }
+
+        // Try AXDescription
+        var descRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef) == .success,
+           let text = descRef as? String, !text.isEmpty {
+            return text
+        }
+
+        // Try AXHelp
+        var helpRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, "AXHelp" as CFString, &helpRef) == .success,
+           let text = helpRef as? String, !text.isEmpty {
+            return text
+        }
+
+        // Try AXStringForRange (parameterized attribute for text areas)
+        var numCharsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, "AXNumberOfCharacters" as CFString, &numCharsRef) == .success,
+           let numChars = numCharsRef as? Int, numChars > 0 {
+            // Create range for all characters
+            var range = CFRange(location: 0, length: min(numChars, 5000))
+            let rangeValue: AXValue? = AXValueCreate(.cfRange, &range)
+            if let rangeValue = rangeValue {
+                var stringRef: CFTypeRef?
+                if AXUIElementCopyParameterizedAttributeValue(element, "AXStringForRange" as CFString, rangeValue, &stringRef) == .success,
+                   let text = stringRef as? String, !text.isEmpty {
+                    return text
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Get text content from a window (searches for AXTextArea, AXStaticText, AXWebArea, etc.)
+    /// Returns up to maxChars of content for search purposes
+    func getWindowContent(windowID: UInt32, pid: pid_t, maxChars: Int = 5000) -> String? {
+        // First, enable accessibility for Electron/Chrome apps
+        enableAppAccessibility(pid: pid)
+
+        let appElement = AXUIElementCreateApplication(pid)
+
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement] else { return nil }
+
+        for axWindow in axWindows {
+            var axWindowID: UInt32 = 0
+            guard _AXUIElementGetWindow(axWindow, &axWindowID) == .success,
+                  axWindowID == windowID else { continue }
+
+            // Search for text content in the window hierarchy
+            var content = ""
+            var visitedTexts = Set<String>()  // Avoid duplicates
+            var elementsVisited = 0
+            let maxElements = 500  // Limit to prevent beachball on huge trees
+
+            func findText(in element: AXUIElement, depth: Int = 0) {
+                elementsVisited += 1
+                guard depth < 20, content.count < maxChars, elementsVisited < maxElements else { return }
+
+                var roleRef: CFTypeRef?
+                _ = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+                let role = (roleRef as? String) ?? ""
+
+                // Roles that typically contain text content
+                let textRoles: Set<String> = ["AXTextArea", "AXTextField", "AXStaticText", "AXText",
+                                 "AXLink", "AXCell", "AXHeading", "AXParagraph"]
+
+                // UI chrome roles - skip entirely (don't extract text or recurse)
+                let chromeRoles: Set<String> = ["AXButton", "AXMenuItem", "AXTab", "AXRadioButton",
+                                   "AXCheckBox", "AXPopUpButton", "AXMenuButton", "AXToolbar",
+                                   "AXMenuBar", "AXMenu", "AXSlider", "AXIncrementor",
+                                   "AXImage", "AXColorWell", "AXComboBox"]
+
+                // Skip chrome roles entirely
+                if chromeRoles.contains(role) {
+                    return
+                }
+
+                // For terminals/text areas, try to get the VALUE which has all text
+                // Use AXStringForRange to get just the visible/recent portion
+                if role == "AXTextArea" || role == "AXTextField" {
+                    // Try to get visible text range first (for terminals, this is what's on screen)
+                    var visibleRangeRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(element, "AXVisibleCharacterRange" as CFString, &visibleRangeRef) == .success,
+                       let rangeValue = visibleRangeRef {
+                        var visibleRange = CFRange()
+                        if AXValueGetValue(rangeValue as! AXValue, .cfRange, &visibleRange) {
+                            // Get the visible text
+                            var rangeForQuery = visibleRange
+                            if let queryRange = AXValueCreate(.cfRange, &rangeForQuery) {
+                                var textRef: CFTypeRef?
+                                if AXUIElementCopyParameterizedAttributeValue(element, "AXStringForRange" as CFString, queryRange, &textRef) == .success,
+                                   let text = textRef as? String, !text.isEmpty {
+                                    if !content.isEmpty { content += " " }
+                                    content += String(text.suffix(maxChars - content.count))  // Take END for terminals
+                                    return
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Extract text from content roles
+                if textRoles.contains(role) {
+                    if let text = getTextFromElement(element), !text.isEmpty {
+                        let trimmed = String(text.prefix(500))
+                        if !visitedTexts.contains(trimmed) && text.count > 2 {
+                            visitedTexts.insert(trimmed)
+                            if !content.isEmpty { content += " " }
+                            content += String(text.prefix(maxChars - content.count))
+                        }
+                    }
+                }
+
+                // Prefer AXVisibleChildren (what's actually on screen) over AXChildren
+                var visibleRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element, "AXVisibleChildren" as CFString, &visibleRef) == .success,
+                   let visible = visibleRef as? [AXUIElement], !visible.isEmpty {
+                    for child in visible {
+                        findText(in: child, depth: depth + 1)
+                        if content.count >= maxChars || elementsVisited >= maxElements { break }
+                    }
+                } else {
+                    // Fall back to all children
+                    var childrenRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+                       let children = childrenRef as? [AXUIElement] {
+                        for child in children {
+                            findText(in: child, depth: depth + 1)
+                            if content.count >= maxChars || elementsVisited >= maxElements { break }
+                        }
+                    }
+                }
+            }
+
+            findText(in: axWindow)
+            debugLog("AX: visited \(elementsVisited) elements, got \(content.count) chars from window \(windowID)")
+            return content.isEmpty ? nil : content
+        }
+        return nil
+    }
+
+    /// Compute a quick hash of an image by sampling pixels (for change detection)
+    func quickImageHash(_ cgImage: CGImage) -> Int {
+        var hasher = Hasher()
+        // Sample a grid of pixels across the image
+        let width = cgImage.width
+        let height = cgImage.height
+        let stepX = max(width / 16, 1)
+        let stepY = max(height / 16, 1)
+
+        guard let dataProvider = cgImage.dataProvider,
+              let data = dataProvider.data,
+              let bytes = CFDataGetBytePtr(data) else {
+            return 0
+        }
+
+        let bytesPerPixel = cgImage.bitsPerPixel / 8
+        let bytesPerRow = cgImage.bytesPerRow
+
+        for y in stride(from: 0, to: height, by: stepY) {
+            for x in stride(from: 0, to: width, by: stepX) {
+                let offset = y * bytesPerRow + x * bytesPerPixel
+                // Sample RGB values
+                if bytesPerPixel >= 3 {
+                    hasher.combine(bytes[offset])      // R
+                    hasher.combine(bytes[offset + 1])  // G
+                    hasher.combine(bytes[offset + 2])  // B
+                }
+            }
+        }
+
+        return hasher.finalize()
+    }
+
+    /// Extract text from an image using Vision OCR
+    func ocrImage(_ image: NSImage) -> String? {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            debugLog("OCR: Failed to get CGImage from NSImage")
+            return nil
+        }
+
+        debugLog("OCR: Processing image \(cgImage.width)x\(cgImage.height)")
+
+        var recognizedText = ""
+        let request = VNRecognizeTextRequest { request, error in
+            if let error = error {
+                debugLog("OCR error: \(error)")
+                return
+            }
+            guard let observations = request.results as? [VNRecognizedTextObservation] else { return }
+
+            // Sort observations by Y position (top to bottom), then X (left to right)
+            let sorted = observations.sorted { obs1, obs2 in
+                // Vision uses normalized coords where Y=1 is top, Y=0 is bottom
+                if abs(obs1.boundingBox.midY - obs2.boundingBox.midY) > 0.02 {
+                    return obs1.boundingBox.midY > obs2.boundingBox.midY  // Higher Y = higher on screen
+                }
+                return obs1.boundingBox.midX < obs2.boundingBox.midX
+            }
+
+            for observation in sorted {
+                if let candidate = observation.topCandidates(1).first {
+                    if !recognizedText.isEmpty { recognizedText += " " }
+                    recognizedText += candidate.string
+                }
+            }
+        }
+        request.recognitionLevel = .accurate  // Better quality
+        request.usesLanguageCorrection = true
+        request.revision = VNRecognizeTextRequestRevision3  // Latest revision
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            debugLog("OCR handler error: \(error)")
+            return nil
+        }
+
+        debugLog("OCR: Got \(recognizedText.count) chars")
+        return recognizedText.isEmpty ? nil : recognizedText
+    }
+
+    /// Get content via OCR from a full-size window capture
+    /// Returns nil if capture failed, returns cached content if screenshot unchanged
+    func getWindowContentViaOCR(windowID: UInt32) async -> String? {
+        // Get window info
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            return nil
+        }
+
+        let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+
+        // For background tabs, check tabOcrCache first
+        if window.parentWindowID != nil {
+            if let cached = getTabOcr(key: cacheKey) {
+                return cached
+            }
+            // Background tabs can't be captured - no content available
+            return nil
+        }
+
+        // Try to capture the window - first via ScreenCaptureKit, then via private API
+        var cgImage: CGImage?
+
+        // Try ScreenCaptureKit first (works for most on-screen windows)
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            if let scWindow = content.windows.first(where: { $0.windowID == windowID }) {
+                let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+                let config = SCStreamConfiguration()
+                // Use actual window size or cap at reasonable resolution for OCR
+                config.width = min(Int(scWindow.frame.width), 1920)
+                config.height = min(Int(scWindow.frame.height), 1080)
+                config.scalesToFit = false
+                config.showsCursor = false
+
+                cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            }
+        } catch {
+            debugLog("OCR: ScreenCaptureKit failed for window \(windowID): \(error)")
+        }
+
+        // Fallback: try private API (works for minimized/other-space windows)
+        if cgImage == nil {
+            debugLog("OCR: Trying private API for window \(windowID)")
+            cgImage = captureWindowViaPrivateAPI(windowID: windowID, fullSize: true)
+        }
+
+        guard let capturedImage = cgImage else {
+            debugLog("OCR: All capture methods failed for window \(windowID)")
+            return nil
+        }
+
+        // Check if screenshot changed - if not, use cached content
+        let newHash = quickImageHash(capturedImage)
+        if let oldHash = screenshotHashes[windowID], oldHash == newHash {
+            // Screenshot unchanged, return cached content
+            if let cached = contentCache[windowID] {
+                debugLog("OCR: Screenshot unchanged for window \(windowID), using cache")
+                return cached
+            }
+        }
+
+        // Screenshot changed or no cache, run OCR
+        let nsImage = NSImage(cgImage: capturedImage, size: NSSize(width: capturedImage.width, height: capturedImage.height))
+        if let text = ocrImage(nsImage) {
+            // Update hash for next comparison
+            screenshotHashes[windowID] = newHash
+            // Also cache by pid+title for when this becomes a background tab
+            setTabOcr(key: cacheKey, text: text)
+            return text
+        }
+        return nil
+    }
+
+    /// Debug: dump what content we can get from all windows
+    func debugContentFetch() {
+        debugLog("=== Content fetch debug ===")
+        for window in windows {
+            if let content = getWindowContent(windowID: window.windowID, pid: window.pid) {
+                let preview = String(content.prefix(200)).replacingOccurrences(of: "\n", with: "\\n")
+                debugLog("[\(window.appName)] '\(window.title)': \(content.count) chars - '\(preview)...'")
+            } else {
+                debugLog("[\(window.appName)] '\(window.title)': NO CONTENT")
+            }
+        }
+        debugLog("=== End content debug ===")
+    }
+
+    /// Background queue for content indexing
+    private static let indexQueue = DispatchQueue(label: "content-index", qos: .utility, attributes: .concurrent)
+    private var isIndexing = false
+
+    /// Track when windows were last indexed (for refresh)
+    private var lastIndexed: [UInt32: Date] = [:]
+
+    /// Index content for all windows in background (10 at a time, using OCR)
+    func indexContentInBackground() {
+        guard !isIndexing else { return }
+        isIndexing = true
+
+        let now = Date()
+        let refreshInterval: TimeInterval = 10  // Re-index on-screen windows every 10 seconds
+
+        // Index windows that:
+        // 1. Have no content and haven't failed, OR
+        // 2. Are on-screen and haven't been indexed recently (content may have changed)
+        let windowsCopy = windows.filter { window in
+            if contentCache[window.windowID] == nil && !contentFailed.contains(window.windowID) {
+                return true  // Never indexed
+            }
+            if window.isOnScreen, let lastTime = lastIndexed[window.windowID],
+               now.timeIntervalSince(lastTime) > refreshInterval {
+                return true  // On-screen and stale
+            }
+            return false
+        }
+
+        guard !windowsCopy.isEmpty else {
+            isIndexing = false
+            return
+        }
+
+        Task {
+            await withTaskGroup(of: Void.self) { group in
+                let semaphore = AsyncSemaphore(limit: 10)
+
+                for window in windowsCopy {
+                    group.addTask { [weak self] in
+                        await semaphore.wait()
+
+                        guard let self = self else {
+                            await semaphore.signal()
+                            return
+                        }
+
+                        // Only try OCR on on-screen windows (can't capture off-screen)
+                        if window.isOnScreen {
+                            if let content = await self.getWindowContentViaOCR(windowID: window.windowID), content.count > 20 {
+                                await MainActor.run {
+                                    self.contentCache[window.windowID] = content
+                                    self.lastIndexed[window.windowID] = Date()
+                                }
+                                await semaphore.signal()
+                                return
+                            }
+                        }
+
+                        // Fall back to AX API (works for all windows)
+                        if let content = self.getWindowContent(windowID: window.windowID, pid: window.pid), content.count > 20 {
+                            await MainActor.run {
+                                self.contentCache[window.windowID] = content
+                                self.lastIndexed[window.windowID] = Date()
+                            }
+                        } else if !window.isOnScreen {
+                            // Only mark as failed if off-screen (on-screen might succeed later)
+                            _ = await MainActor.run {
+                                self.contentFailed.insert(window.windowID)
+                            }
+                        }
+
+                        await semaphore.signal()
+                    }
+                }
+            }
+
+            await MainActor.run { [weak self] in
+                self?.isIndexing = false
+            }
+        }
+    }
+
+    /// Search cached content only (instant, never blocks)
+    func searchContent(query: String) async {
+        guard !query.isEmpty else {
+            contentMatches = [:]
+            return
+        }
+
+        let queryLower = query.lowercased()
+        let terms = queryLower.split(separator: " ").map { String($0) }
+
+        var newMatches: [UInt32: Int] = [:]
+
+        // Search only cached content - instant
+        for window in windows {
+            guard let content = contentCache[window.windowID] else { continue }
+
+            let contentLower = content.lowercased()
+            var totalScore = 0
+            var allMatch = true
+
+            for term in terms {
+                if contentLower.contains(term) {
+                    totalScore += term.count * 2
+                } else {
+                    allMatch = false
+                    break
+                }
+            }
+
+            if allMatch && totalScore > 0 {
+                newMatches[window.windowID] = totalScore
+            }
+        }
+
+        contentMatches = newMatches
+    }
+
+    /// Clear content cache for a window (call when window content might have changed)
+    func invalidateContentCache(for windowID: UInt32) {
+        contentCache.removeValue(forKey: windowID)
+        contentFailed.remove(windowID)
+    }
+
+    /// Clear all content caches
+    func clearContentCache() {
+        contentCache.removeAll()
+        contentMatches.removeAll()
+        contentFailed.removeAll()
+    }
+
+    func refresh() {
+        // Reset synthetic ID counter for this refresh cycle
+        syntheticIDCounter = UInt32.max - 1_000_000
+
+        // First: Get windows on the CURRENT space only (for accurate z-order and current-space detection)
+        var currentSpaceWindowIDs = Set<UInt32>()
+        var zOrder: [UInt32: Int] = [:]  // Lower = closer to front (from current space query)
+        var zIndex = 0
+
+        if let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for windowDict in windowList {
+                guard let windowID = windowDict[kCGWindowNumber as String] as? UInt32,
+                      let layer = windowDict[kCGWindowLayer as String] as? Int,
+                      layer == 0
+                else { continue }
+                currentSpaceWindowIDs.insert(windowID)
+                zOrder[windowID] = zIndex
+                zIndex += 1
+            }
+        }
+        debugLog("Current space has \(currentSpaceWindowIDs.count) windows (IDs: \(currentSpaceWindowIDs.sorted()))")
+
+        // Second: Get ALL windows (including other spaces) for frame info
+        var cgWindowInfo: [UInt32: (frame: CGRect, isOnScreen: Bool, title: String, pid: pid_t, appName: String)] = [:]
+
+        if let windowList = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for windowDict in windowList {
+                guard let windowID = windowDict[kCGWindowNumber as String] as? UInt32,
+                      let boundsDict = windowDict[kCGWindowBounds as String] as? [String: CGFloat],
+                      let layer = windowDict[kCGWindowLayer as String] as? Int,
+                      let pid = windowDict[kCGWindowOwnerPID as String] as? pid_t,
+                      layer == 0
+                else { continue }
+
+                let frame = CGRect(
+                    x: boundsDict["X"] ?? 0,
+                    y: boundsDict["Y"] ?? 0,
+                    width: boundsDict["Width"] ?? 0,
+                    height: boundsDict["Height"] ?? 0
+                )
+                let isOnScreen = windowDict[kCGWindowIsOnscreen as String] as? Bool ?? false
+                let title = windowDict[kCGWindowName as String] as? String ?? ""
+                let appName = windowDict[kCGWindowOwnerName as String] as? String ?? "Unknown"
+                cgWindowInfo[windowID] = (frame, isOnScreen, title, pid, appName)
+            }
+        }
+
+        var newWindows: [WindowInfo] = []
+        let myPID = ProcessInfo.processInfo.processIdentifier
+
+        // Use AX API as source of truth for what windows exist
+        // This correctly enumerates tabs in tabbed windows
+        let runningApps = NSWorkspace.shared.runningApplications
+        for app in runningApps {
+            guard app.activationPolicy == .regular else { continue }
+            let pid = app.processIdentifier
+            if pid == myPID { continue }
+
+            let appName = app.localizedName ?? "Unknown"
+            if Self.excludedApps.contains(appName) { continue }
+
+            // Cache the app icon once per app (avoid repeated lookups)
+            let appIcon = app.icon
+
+            let appElement = AXUIElementCreateApplication(pid)
+            var windowsRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+                  let axWindows = windowsRef as? [AXUIElement] else { continue }
+
+            for axWindow in axWindows {
+                // Get CGWindowID for this AX window
+                var windowID: UInt32 = 0
+                guard _AXUIElementGetWindow(axWindow, &windowID) == .success else { continue }
+
+                // Get title from AX (more reliable for tabs)
+                var titleRef: CFTypeRef?
+                var title = ""
+                if AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef) == .success,
+                   let axTitle = titleRef as? String {
+                    title = axTitle
+                }
+
+                // Fall back to CG title if AX title is empty
+                if title.isEmpty, let cgInfo = cgWindowInfo[windowID] {
+                    title = cgInfo.title
+                }
+
+                // Skip windows without titles
+                if title.isEmpty { continue }
+
+                // Get frame - prefer CG info for accuracy
+                var frame = CGRect.zero
+                var isOnScreen = false
+                if let cgInfo = cgWindowInfo[windowID] {
+                    frame = cgInfo.frame
+                    isOnScreen = cgInfo.isOnScreen
+                } else {
+                    // Fall back to AX position/size
+                    var posRef: CFTypeRef?
+                    var sizeRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &posRef) == .success,
+                       AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef) == .success {
+                        var pos = CGPoint.zero
+                        var size = CGSize.zero
+                        AXValueGetValue(posRef as! AXValue, .cgPoint, &pos)
+                        AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+                        frame = CGRect(origin: pos, size: size)
+                        isOnScreen = true  // If AX can see it, assume it's on screen
+                    }
+                }
+
+                // Skip tiny windows
+                if frame.width < 100 || frame.height < 100 { continue }
+
+                // Check for tabs in this window
+                // Try browser-specific AppleScript first (Safari, Chrome, Arc)
+                // Fall back to AX-based detection for other apps
+                let bundleId = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+                let tabInfo: (titles: [String], selectedIndex: Int)
+                if let browserTabs = getBrowserTabs(bundleId: bundleId, appName: appName) {
+                    tabInfo = browserTabs
+                } else {
+                    tabInfo = getTabTitles(from: axWindow)
+                }
+                let tabTitles = tabInfo.titles
+
+                // Determine if this window is on the current space
+                let isOnCurrentSpace = currentSpaceWindowIDs.contains(windowID)
+
+                // Debug: track space classification
+                if !isOnCurrentSpace {
+                    debugLog("Window \(windowID) '\(title)' from \(appName) NOT in currentSpaceWindowIDs (AX visible, CG not on-screen)")
+                }
+
+                if tabTitles.isEmpty {
+                    // No tabs - just add the window
+                    var windowInfo = WindowInfo(
+                        windowID: windowID,
+                        parentWindowID: nil,
+                        pid: pid,
+                        appName: appName,
+                        title: title,
+                        frame: frame,
+                        isOnScreen: isOnScreen,
+                        appIcon: appIcon
+                    )
+                    windowInfo.isOnCurrentSpace = isOnCurrentSpace
+                    debugLog("AX add: \(appName) '\(title)' wid=\(windowID) onCurrentSpace=\(isOnCurrentSpace) onScreen=\(isOnScreen)")
+                    newWindows.append(windowInfo)
+                } else {
+                    // Has tabs - add each tab
+                    // Determine which tab is active:
+                    // 1. Use AX selected index if available
+                    // 2. Fall back to title matching
+                    // 3. Default to first tab if neither works
+                    var activeTabIndex = tabInfo.selectedIndex
+                    if activeTabIndex < 0 {
+                        // Try title matching as fallback
+                        for (index, tabTitle) in tabTitles.enumerated() {
+                            if tabTitle == title || title.contains(tabTitle) || tabTitle.contains(title) {
+                                activeTabIndex = index
+                                break
+                            }
+                        }
+                    }
+                    // If still unknown, use first tab as active
+                    if activeTabIndex < 0 { activeTabIndex = 0 }
+
+                    for (index, tabTitle) in tabTitles.enumerated() {
+                        let isActiveTab = (index == activeTabIndex)
+
+                        // For active tab, use the real window ID
+                        // For other tabs, use stable synthetic IDs based on content
+                        let finalWindowID: UInt32
+                        if isActiveTab {
+                            finalWindowID = windowID
+                        } else {
+                            // Generate stable synthetic ID from parent + title + index
+                            // This ensures the same tab gets the same ID across refreshes
+                            let stableKey = "\(windowID):\(tabTitle):\(index)"
+                            var hasher = Hasher()
+                            hasher.combine(stableKey)
+                            let hash = hasher.finalize()
+                            // Use high bits to avoid collision with real window IDs
+                            finalWindowID = UInt32(truncatingIfNeeded: UInt(bitPattern: hash)) | 0x80000000
+                        }
+
+                        var windowInfo = WindowInfo(
+                            windowID: finalWindowID,
+                            parentWindowID: isActiveTab ? nil : windowID,  // Active tab is "main"
+                            pid: pid,
+                            appName: appName,
+                            title: tabTitle,
+                            frame: frame,
+                            isOnScreen: isActiveTab,
+                            appIcon: appIcon
+                        )
+                        windowInfo.isOnCurrentSpace = isOnCurrentSpace
+                        windowInfo.tabIndex = index
+                        debugLog("AX add tab: \(appName) '\(tabTitle)' wid=\(finalWindowID) parent=\(windowID) onCurrentSpace=\(isOnCurrentSpace) active=\(isActiveTab)")
+                        newWindows.append(windowInfo)
+                    }
+                }
+            }
+        }
+
+        debugLog("After AX enumeration: \(newWindows.count) windows")
+
+        // Track which window IDs we've already added from AX enumeration
+        // Include both windowID and parentWindowID to catch all real window IDs
+        var axWindowIDs = Set(newWindows.map { $0.windowID })
+        for window in newWindows {
+            if let parentID = window.parentWindowID {
+                axWindowIDs.insert(parentID)
+            }
+        }
+        debugLog("axWindowIDs (including parents): \(axWindowIDs.sorted())")
+
+        // Build list of windows by app for duplicate detection
+        let axWindowsByApp = Dictionary(grouping: newWindows, by: { $0.appName })
+
+        // Helper to normalize titles for comparison (strip terminal dimensions, handle ellipsis)
+        func normalizeTitle(_ title: String) -> String {
+            var t = title
+            // Strip terminal dimensions like " — 124×36" at the end
+            if let range = t.range(of: #" — \d+×\d+$"#, options: .regularExpression) {
+                t.removeSubrange(range)
+            }
+            // Replace ellipsis with empty for prefix matching
+            t = t.replacingOccurrences(of: "…", with: "")
+            return t
+        }
+
+        // Add windows from OTHER spaces using CG info (AX can't see them)
+        // These are windows in cgWindowInfo but NOT in currentSpaceWindowIDs and NOT already added
+        for (windowID, cgInfo) in cgWindowInfo {
+            // Skip if already added via AX (including as parent of a tab), or if on current space
+            if axWindowIDs.contains(windowID) || currentSpaceWindowIDs.contains(windowID) {
+                continue
+            }
+
+            // Skip windows without titles
+            if cgInfo.title.isEmpty { continue }
+
+            // Skip if we have an AX window from the same app with a matching title
+            // This catches background tabs which have different CG window IDs
+            if let axWindows = axWindowsByApp[cgInfo.appName] {
+                let cgNorm = normalizeTitle(cgInfo.title)
+                let isDuplicate = axWindows.contains { axWindow in
+                    let axNorm = normalizeTitle(axWindow.title)
+                    return axNorm == cgNorm ||
+                           axNorm.contains(cgNorm) ||
+                           cgNorm.contains(axNorm)
+                }
+                if isDuplicate {
+                    debugLog("CG skip duplicate title: \(cgInfo.appName) '\(cgInfo.title)' wid=\(windowID)")
+                    continue
+                }
+            }
+
+            // Skip tiny windows
+            if cgInfo.frame.width < 100 || cgInfo.frame.height < 100 { continue }
+
+            // Skip phantom windows that don't belong to any space
+            // Real windows belong to at least one space; orphaned/zombie windows have empty space list
+            let windowArray = [windowID as CFNumber] as CFArray
+            let spaces = CGSCopySpacesForWindows(CGSMainConnectionID(), 0x7, windowArray) as? [CGSSpaceID] ?? []
+            if spaces.isEmpty {
+                debugLog("CG skip phantom window (no space): \(cgInfo.appName) '\(cgInfo.title)' wid=\(windowID)")
+                continue
+            }
+
+            // Skip our own windows
+            if cgInfo.pid == myPID { continue }
+
+            // Skip excluded apps
+            if Self.excludedApps.contains(cgInfo.appName) { continue }
+
+            // Get app icon for this PID
+            let otherSpaceAppIcon = NSRunningApplication(processIdentifier: cgInfo.pid)?.icon
+
+            var windowInfo = WindowInfo(
+                windowID: windowID,
+                parentWindowID: nil,
+                pid: cgInfo.pid,
+                appName: cgInfo.appName,
+                title: cgInfo.title,
+                frame: cgInfo.frame,
+                isOnScreen: cgInfo.isOnScreen,
+                appIcon: otherSpaceAppIcon
+            )
+            windowInfo.isOnCurrentSpace = false
+            debugLog("CG add other-space: \(cgInfo.appName) '\(cgInfo.title)' wid=\(windowID)")
+            newWindows.append(windowInfo)
+        }
+
+        debugLog("After CG enumeration: \(newWindows.count) windows total")
+
+        // Sort by z-order (front to back), windows not in z-order map go to end
+        // But if sidebar is visible, preserve the current order to avoid jumping
+        if (isCycling || sidebarVisible) && !windows.isEmpty {
+            // Preserve existing order - sort new windows by their position in current list
+            // Use reduce to handle potential duplicate windowIDs (keep first occurrence)
+            var currentOrder: [UInt32: Int] = [:]
+            for (index, window) in windows.enumerated() {
+                if currentOrder[window.windowID] == nil {
+                    currentOrder[window.windowID] = index
+                }
+            }
+            newWindows.sort { a, b in
+                let aOrder = currentOrder[a.windowID] ?? Int.max
+                let bOrder = currentOrder[b.windowID] ?? Int.max
+                return aOrder < bOrder
+            }
+        } else {
+            newWindows.sort { a, b in
+                let aOrder = zOrder[a.windowID] ?? Int.max
+                let bOrder = zOrder[b.windowID] ?? Int.max
+                return aOrder < bOrder
+            }
+        }
+
+        // Compute duplicate indices for windows with same title in same app
+        var seenTitles: [String: Int] = [:]
+        for i in 0..<newWindows.count {
+            let key = "\(newWindows[i].pid):\(newWindows[i].title)"
+            let count = seenTitles[key] ?? 0
+            newWindows[i].duplicateIndex = count
+            seenTitles[key] = count + 1
+        }
+
+        // Cluster tabs: group windows from same app with same frame
+        // The frontmost tab stays in z-order position, others cluster after it
+        newWindows = clusterTabs(newWindows)
+
+        DispatchQueue.main.async {
+            self.windows = newWindows
+            // Index content in background for instant search
+            self.indexContentInBackground()
+        }
+    }
+
+    /// Cluster tabs together: tabs with same parentWindowID are grouped
+    /// The frontmost tab (by z-order) stays in place, others follow immediately after
+    private func clusterTabs(_ windows: [WindowInfo]) -> [WindowInfo] {
+        // Build a map of parent window ID -> indices of child tabs
+        // Also track which windows are parents (have tabs pointing to them)
+        var tabsByParent: [UInt32: [Int]] = [:]
+        var parentIndices: [UInt32: Int] = [:]
+
+        for (index, window) in windows.enumerated() {
+            if let parentID = window.parentWindowID {
+                // This is a tab - group by parent
+                tabsByParent[parentID, default: []].append(index)
+            } else {
+                // This might be a parent window
+                parentIndices[window.windowID] = index
+            }
+        }
+
+        // If no tabs, return as-is
+        if tabsByParent.isEmpty {
+            return windows
+        }
+
+        // Build the clustered list
+        var result: [WindowInfo] = []
+        var consumed: Set<Int> = []
+
+        for (index, window) in windows.enumerated() {
+            if consumed.contains(index) {
+                continue
+            }
+
+            result.append(window)
+            consumed.insert(index)
+
+            // If this window has tabs, add them right after (indented)
+            if let tabIndices = tabsByParent[window.windowID] {
+                for tabIndex in tabIndices {
+                    if !consumed.contains(tabIndex) {
+                        var clusteredWindow = windows[tabIndex]
+                        clusteredWindow.isClusteredTab = true
+                        result.append(clusteredWindow)
+                        consumed.insert(tabIndex)
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    /// Capture a window image using CGSHWCaptureWindowList private API
+    /// This can capture minimized windows and windows on other spaces that ScreenCaptureKit cannot
+    func captureWindowViaPrivateAPI(windowID: UInt32, fullSize: Bool = false) -> CGImage? {
+        var wid = CGWindowID(windowID)
+        let options: CGSWindowCaptureOptions = fullSize
+            ? [.ignoreGlobalClipShape, .bestResolution, .fullSize]
+            : [.ignoreGlobalClipShape, .bestResolution]
+
+        // Match AltTab's exact calling pattern
+        let result = CGSHWCaptureWindowList(CGSMainConnectionID(), &wid, 1, options)
+        let images = result.takeRetainedValue() as? [CGImage] ?? []
+
+        guard let image = images.first else {
+            debugLog("CGSHWCaptureWindowList failed for window \(windowID)")
+            return nil
+        }
+
+        return image
+    }
+
+    /// Generate a placeholder image that looks like a macOS window
+    /// Used when we can't capture a real screenshot (background tabs, etc.)
+    func generatePlaceholderWindow(title: String, appIcon: NSImage?, size: CGSize) -> NSImage {
+        let titleBarHeight: CGFloat = 28
+        let trafficLightSize: CGFloat = 12
+        let trafficLightSpacing: CGFloat = 8
+        let trafficLightLeftPadding: CGFloat = 14
+        let cornerRadius: CGFloat = 10
+
+        let image = NSImage(size: size)
+        image.lockFocus()
+
+        // Window background (dark mode style)
+        let windowPath = NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: cornerRadius, yRadius: cornerRadius)
+        NSColor(white: 0.15, alpha: 1.0).setFill()
+        windowPath.fill()
+
+        // Title bar background (slightly lighter)
+        let titleBarPath = NSBezierPath()
+        titleBarPath.move(to: NSPoint(x: 0, y: size.height - titleBarHeight))
+        titleBarPath.line(to: NSPoint(x: 0, y: size.height - cornerRadius))
+        titleBarPath.appendArc(withCenter: NSPoint(x: cornerRadius, y: size.height - cornerRadius),
+                               radius: cornerRadius, startAngle: 180, endAngle: 90, clockwise: true)
+        titleBarPath.line(to: NSPoint(x: size.width - cornerRadius, y: size.height))
+        titleBarPath.appendArc(withCenter: NSPoint(x: size.width - cornerRadius, y: size.height - cornerRadius),
+                               radius: cornerRadius, startAngle: 90, endAngle: 0, clockwise: true)
+        titleBarPath.line(to: NSPoint(x: size.width, y: size.height - titleBarHeight))
+        titleBarPath.close()
+        NSColor(white: 0.22, alpha: 1.0).setFill()
+        titleBarPath.fill()
+
+        // Traffic lights
+        let trafficLightY = size.height - titleBarHeight / 2 - trafficLightSize / 2
+        let colors: [NSColor] = [
+            NSColor(red: 1.0, green: 0.38, blue: 0.35, alpha: 1.0),  // Close (red)
+            NSColor(red: 1.0, green: 0.78, blue: 0.25, alpha: 1.0),  // Minimize (yellow)
+            NSColor(red: 0.3, green: 0.8, blue: 0.35, alpha: 1.0)    // Zoom (green)
+        ]
+        for (index, color) in colors.enumerated() {
+            let x = trafficLightLeftPadding + CGFloat(index) * (trafficLightSize + trafficLightSpacing)
+            let circleRect = NSRect(x: x, y: trafficLightY, width: trafficLightSize, height: trafficLightSize)
+            let circle = NSBezierPath(ovalIn: circleRect)
+            color.setFill()
+            circle.fill()
+        }
+
+        // Title text (centered in title bar, avoiding traffic lights)
+        let titleFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: titleFont,
+            .foregroundColor: NSColor(white: 0.9, alpha: 1.0)
+        ]
+        let titleString = NSAttributedString(string: title, attributes: titleAttributes)
+        let titleSize = titleString.size()
+        let titleX = max(trafficLightLeftPadding + 3 * (trafficLightSize + trafficLightSpacing) + 10,
+                         (size.width - titleSize.width) / 2)
+        let titleY = size.height - titleBarHeight / 2 - titleSize.height / 2
+        let availableWidth = size.width - titleX - 10
+        if availableWidth > 50 {
+            let drawRect = NSRect(x: titleX, y: titleY, width: min(titleSize.width, availableWidth), height: titleSize.height)
+            titleString.draw(with: drawRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+        }
+
+        // App icon centered in content area
+        if let icon = appIcon {
+            let contentHeight = size.height - titleBarHeight
+            let iconSize = min(contentHeight * 0.5, size.width * 0.4, 128)
+            let iconX = (size.width - iconSize) / 2
+            let iconY = (contentHeight - iconSize) / 2
+            let iconRect = NSRect(x: iconX, y: iconY, width: iconSize, height: iconSize)
+            icon.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 0.8)
+        }
+
+        // Subtle border
+        let borderPath = NSBezierPath(roundedRect: NSRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5),
+                                       xRadius: cornerRadius, yRadius: cornerRadius)
+        NSColor(white: 0.3, alpha: 1.0).setStroke()
+        borderPath.lineWidth = 1
+        borderPath.stroke()
+
+        image.unlockFocus()
+        return image
+    }
+
+    func thumbnail(for windowID: UInt32, maxSize: CGSize = CGSize(width: 200, height: 150)) async -> NSImage? {
+        debugLog("thumbnail: starting for window \(windowID)")
+
+        // Get window info
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            // Return cached if window no longer exists
+            debugLog("thumbnail: window \(windowID) not found, returning cache")
+            return thumbnailCache[windowID]
+        }
+
+        // For background tabs, check tab screenshot cache first
+        if window.parentWindowID != nil {
+            let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+            debugLog("thumbnail: background tab '\(window.title)' cacheKey='\(cacheKey)'")
+            if let cached = getTabScreenshot(key: cacheKey) {
+                debugLog("thumbnail: cache HIT for '\(cacheKey)'")
+                return cached
+            }
+            debugLog("thumbnail: cache MISS for '\(cacheKey)' (have \(cacheLock.withLock { _tabScreenshotCache.count }) cached)")
+            // Background tabs can't be captured directly - generate placeholder window
+            let appIcon = NSRunningApplication(processIdentifier: window.pid)?.icon
+            // Use parent window's frame (tabs have same size as parent)
+            let parentFrame = windows.first(where: { $0.windowID == window.parentWindowID })?.frame ?? window.frame
+            // Scale to fit maxSize while preserving aspect ratio
+            let aspectRatio = parentFrame.width / parentFrame.height
+            let placeholderSize: CGSize
+            if aspectRatio > maxSize.width / maxSize.height {
+                // Window is wider - constrain by width
+                placeholderSize = CGSize(width: maxSize.width, height: maxSize.width / aspectRatio)
+            } else {
+                // Window is taller - constrain by height
+                placeholderSize = CGSize(width: maxSize.height * aspectRatio, height: maxSize.height)
+            }
+            let placeholder = generatePlaceholderWindow(title: window.title, appIcon: appIcon, size: placeholderSize)
+            return placeholder
+        }
+
+        // Try ScreenCaptureKit for visible windows
+        debugLog("thumbnail: trying ScreenCaptureKit for window \(windowID)")
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            if let scWindow = content.windows.first(where: { $0.windowID == windowID }) {
+                debugLog("thumbnail: found scWindow for \(windowID)")
+                let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+                let config = SCStreamConfiguration()
+                // Capture at higher resolution for quality
+                config.width = Int(maxSize.width * 2)
+                config.height = Int(maxSize.height * 2)
+                config.scalesToFit = true
+                config.showsCursor = false
+
+                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                let nsImage = NSImage(cgImage: image, size: maxSize)
+                thumbnailCache[windowID] = nsImage
+
+                // Cache full resolution version for background tab use
+                let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+                debugLog("thumbnail: caching screenshot for '\(window.title)' cacheKey='\(cacheKey)'")
+                let fullResConfig = SCStreamConfiguration()
+                fullResConfig.width = Int(scWindow.frame.width * 2)  // Retina
+                fullResConfig.height = Int(scWindow.frame.height * 2)
+                fullResConfig.scalesToFit = false
+                fullResConfig.showsCursor = false
+                if let fullResImage = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: fullResConfig) {
+                    let fullResNsImage = NSImage(cgImage: fullResImage, size: scWindow.frame.size)
+                    setTabScreenshot(key: cacheKey, image: fullResNsImage)
+                    debugLog("thumbnail: cached screenshot for '\(cacheKey)' (now have \(cacheLock.withLock { _tabScreenshotCache.count }) cached)")
+                }
+
+                return nsImage
+            }
+        } catch {
+            // ScreenCaptureKit failed - try private API fallback
+            debugLog("ScreenCaptureKit failed for window \(windowID), trying private API")
+        }
+
+        // Fallback: try private API (works for minimized/other-space windows)
+        if let cgImage = captureWindowViaPrivateAPI(windowID: windowID, fullSize: false) {
+            debugLog("Private API captured window \(windowID): \(cgImage.width)x\(cgImage.height)")
+            let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+            let nsImage = NSImage(cgImage: cgImage, size: size)
+
+            // Scale down to maxSize
+            let scale = min(maxSize.width / size.width, maxSize.height / size.height)
+            let scaledSize = CGSize(width: size.width * scale, height: size.height * scale)
+            let scaledImage = NSImage(size: scaledSize)
+            scaledImage.lockFocus()
+            nsImage.draw(in: NSRect(origin: .zero, size: scaledSize))
+            scaledImage.unlockFocus()
+
+            return scaledImage
+        }
+
+        // Final fallback: use app icon
+        if let app = NSRunningApplication(processIdentifier: window.pid),
+           let icon = app.icon {
+            return icon
+        }
+
+        return nil
+    }
+
+    func bringToFront(_ windowID: UInt32) {
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            debugLog("Window \(windowID) not found in list")
+            return
+        }
+
+        debugLog("Bringing to front: window \(windowID) '\(window.title)' from \(window.appName)")
+
+        // Use the proper private APIs to focus this window
+        focusWindow(windowID)
+
+        // Also ensure the app is activated and window gets keyboard focus
+        bringAppToFront(pid: window.pid)
+    }
+
+    /// Toggle fullscreen for a window using Accessibility API
+    func toggleFullscreen(_ windowID: UInt32) {
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            debugLog("Fullscreen: Window \(windowID) not found")
+            return
+        }
+
+        debugLog("Toggling fullscreen for window \(windowID) '\(window.title)'")
+
+        let appElement = AXUIElementCreateApplication(window.pid)
+
+        // Get windows
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement] else {
+            debugLog("Fullscreen: Could not get AX windows")
+            return
+        }
+
+        // Find the window by matching title or just use first window
+        var targetWindow: AXUIElement?
+        for axWindow in axWindows {
+            var titleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef) == .success,
+               let title = titleRef as? String,
+               title == window.title {
+                targetWindow = axWindow
+                break
+            }
+        }
+
+        // Fall back to first window if no match
+        if targetWindow == nil {
+            targetWindow = axWindows.first
+        }
+
+        guard let axWindow = targetWindow else {
+            debugLog("Fullscreen: No target window found")
+            return
+        }
+
+        // Get the fullscreen button and press it
+        var buttonRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axWindow, kAXFullScreenButtonAttribute as CFString, &buttonRef) == .success,
+           let button = buttonRef as! AXUIElement? {
+            let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
+            debugLog("Fullscreen button press result: \(result == .success ? "success" : "failed")")
+        } else {
+            debugLog("Fullscreen: Could not get fullscreen button")
+        }
+    }
+
+    /// Direct AX-based tab switching - clicks tab radio buttons directly via Accessibility API
+    /// Returns true if successful
+    private func selectTabViaAX(pid: pid_t, tabIndex: Int, tabTitle: String? = nil) -> Bool {
+        let appElement = AXUIElementCreateApplication(pid)
+
+        // Get windows
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement],
+              let window = axWindows.first else {
+            print("[Winby] AX tab switch: no windows found")
+            return false
+        }
+
+        // Find tab group recursively
+        func findTabGroup(in element: AXUIElement, depth: Int = 0) -> AXUIElement? {
+            guard depth < 6 else { return nil }
+
+            var roleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+               let role = roleRef as? String, role == "AXTabGroup" {
+                return element
+            }
+
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                for child in children {
+                    if let found = findTabGroup(in: child, depth: depth + 1) {
+                        return found
+                    }
+                }
+            }
+            return nil
+        }
+
+        guard let tabGroup = findTabGroup(in: window) else {
+            print("[Winby] AX tab switch: no tab group found")
+            return false
+        }
+
+        // Get children (radio buttons) of tab group
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(tabGroup, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else {
+            print("[Winby] AX tab switch: no children in tab group")
+            return false
+        }
+
+        // Filter to radio buttons only and collect with titles
+        var radioButtons: [(element: AXUIElement, title: String)] = []
+        for child in children {
+            var roleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleRef) == .success,
+               let role = roleRef as? String, role == "AXRadioButton" {
+                var titleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXTitleAttribute as CFString, &titleRef)
+                let title = titleRef as? String ?? ""
+                radioButtons.append((child, title))
+            }
+        }
+
+        // Find target tab - prefer title match, fall back to index
+        var targetTab: AXUIElement?
+        var matchedTitle = ""
+
+        if let tabTitle = tabTitle {
+            // Try exact match first
+            for (element, title) in radioButtons {
+                if title == tabTitle {
+                    targetTab = element
+                    matchedTitle = title
+                    break
+                }
+            }
+            // Try contains match if no exact match
+            if targetTab == nil {
+                for (element, title) in radioButtons {
+                    if title.contains(tabTitle) || tabTitle.contains(title) {
+                        targetTab = element
+                        matchedTitle = title
+                        break
+                    }
+                }
+            }
+        }
+
+        // Fall back to index if title match failed
+        if targetTab == nil && tabIndex < radioButtons.count {
+            targetTab = radioButtons[tabIndex].element
+            matchedTitle = radioButtons[tabIndex].title
+        }
+
+        guard let tab = targetTab else {
+            print("[Winby] AX tab switch: could not find tab '\(tabTitle ?? "index \(tabIndex)")' (have \(radioButtons.count) tabs: \(radioButtons.map { $0.title }))")
+            return false
+        }
+
+        // Click it
+        let result = AXUIElementPerformAction(tab, kAXPressAction as CFString)
+        print("[Winby] AX tab switch: clicked '\(matchedTitle)' - result: \(result.rawValue)")
+        return result == .success
+    }
+
+    /// Try to select a tab using AppleScript (more reliable for Terminal, Safari, etc.)
+    /// Returns true if AppleScript worked, false if we need to fall back to AX
+    private func selectTabViaAppleScript(appName: String, pid: pid_t, tabTitle: String, tabIndex: Int) -> Bool {
+        let bundleId = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+
+        // For Terminal.app and Ghostty, use direct AX approach (AppleScript doesn't work reliably from Swift)
+        if bundleId == "com.apple.Terminal" || bundleId == "com.mitchellh.ghostty" {
+            print("[Winby] \(appName) detected, using direct AX tab switch for '\(tabTitle)'")
+            return selectTabViaAX(pid: pid, tabIndex: tabIndex, tabTitle: tabTitle)
+        }
+
+        let escapedTitle = tabTitle.replacingOccurrences(of: "\\", with: "\\\\")
+                                   .replacingOccurrences(of: "\"", with: "\\\"")
+        let targetIndex = tabIndex + 1  // AppleScript is 1-indexed
+
+        var script: String
+
+        // Use native AppleScript for browsers (they have proper scripting support)
+        if bundleId == "com.apple.Safari" || appName == "Safari" {
+            print("[Winby] Safari tab switch: '\(tabTitle)' at index \(targetIndex)")
+            script = """
+            tell application "Safari"
+                repeat with w in windows
+                    set tabCount to count of tabs of w
+                    -- Try by index first
+                    if \(targetIndex) ≤ tabCount then
+                        set t to tab \(targetIndex) of w
+                        set current tab of w to t
+                        return "clicked by index: " & (name of t)
+                    end if
+                    -- Fall back to title match
+                    repeat with i from 1 to tabCount
+                        set t to tab i of w
+                        if name of t contains "\(escapedTitle)" then
+                            set current tab of w to t
+                            return "clicked by title: " & (name of t)
+                        end if
+                    end repeat
+                    exit repeat
+                end repeat
+                return "not found"
+            end tell
+            """
+        } else if bundleId == "com.google.Chrome" || appName.contains("Chrome") {
+            print("[Winby] Chrome tab switch: '\(tabTitle)' at index \(targetIndex)")
+            script = """
+            tell application "Google Chrome"
+                repeat with w in windows
+                    set tabCount to count of tabs of w
+                    -- Try by index first
+                    if \(targetIndex) ≤ tabCount then
+                        set active tab index of w to \(targetIndex)
+                        return "clicked by index: " & (title of tab \(targetIndex) of w)
+                    end if
+                    -- Fall back to title match
+                    repeat with i from 1 to tabCount
+                        if title of tab i of w contains "\(escapedTitle)" then
+                            set active tab index of w to i
+                            return "clicked by title: " & (title of tab i of w)
+                        end if
+                    end repeat
+                    exit repeat
+                end repeat
+                return "not found"
+            end tell
+            """
+        } else {
+            // For native apps (Terminal, Ghostty, etc), use System Events
+            let escapedAppName = appName.replacingOccurrences(of: "\"", with: "\\\"")
+            print("[Winby] System Events tab switch for \(appName): '\(tabTitle)' at index \(targetIndex)")
+            script = """
+            tell application "System Events"
+                tell process "\(escapedAppName)"
+                    tell window 1
+                        try
+                            set tg to tab group 1
+                            set tabButtons to every radio button of tg
+                            set tabCount to count of tabButtons
+
+                            -- Click by index directly (handles duplicate titles)
+                            if \(targetIndex) ≤ tabCount then
+                                set t to radio button \(targetIndex) of tg
+                                click t
+                                return "clicked"
+                            end if
+
+                            return "index \(targetIndex) out of range, only " & tabCount & " tabs"
+                        on error errMsg
+                            return "error: " & errMsg
+                        end try
+                    end tell
+                end tell
+            end tell
+            """
+        }
+
+        var error: NSDictionary?
+        if let appleScript = NSAppleScript(source: script) {
+            let result = appleScript.executeAndReturnError(&error)
+            if let error = error {
+                print("[Winby] AppleScript error: \(error)")
+                return false
+            }
+            let resultStr = result.stringValue ?? "unknown"
+            print("[Winby] AppleScript result: \(resultStr)")
+            return resultStr.contains("clicked")
+        }
+
+        return false
+    }
+
+    /// Cache screenshots for all background tabs by temporarily switching to each tab
+    /// This is called after the sidebar is dismissed when cacheBackgroundTabs is enabled
+    func cacheBackgroundTabScreenshots() async {
+        // Both settings must be enabled for caching to run
+        guard AppConfig.shared.cacheBackgroundTabs && AppConfig.shared.showBackgroundTabs else { return }
+
+        // Only run when Winby is in the background (not active)
+        let isActive = await MainActor.run { NSApp.isActive }
+        guard !isActive else {
+            debugLog("cacheBackgroundTabs: Winby is active, skipping")
+            return
+        }
+
+        // Prevent concurrent runs
+        guard !_isCachingBackgroundTabs else {
+            debugLog("cacheBackgroundTabs: already running, skipping")
+            return
+        }
+        _isCachingBackgroundTabs = true
+        defer { _isCachingBackgroundTabs = false }
+
+        debugLog("cacheBackgroundTabs: starting background tab caching")
+
+        // Group background tabs by their parent window
+        var tabsByParent: [UInt32: [(window: WindowInfo, index: Int)]] = [:]
+        for window in windows {
+            if let parentID = window.parentWindowID {
+                let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
+                // Skip if already cached
+                if getTabScreenshot(key: cacheKey) != nil {
+                    debugLog("cacheBackgroundTabs: already cached '\(window.title)'")
+                    continue
+                }
+                tabsByParent[parentID, default: []].append((window, window.tabIndex))
+            }
+        }
+
+        if tabsByParent.isEmpty {
+            debugLog("cacheBackgroundTabs: no uncached background tabs found")
+            return
+        }
+
+        debugLog("cacheBackgroundTabs: found \(tabsByParent.values.flatMap { $0 }.count) uncached tabs in \(tabsByParent.count) windows")
+
+        // Process each parent window's tabs
+        for (parentID, tabs) in tabsByParent {
+            guard let parentWindow = windows.first(where: { $0.windowID == parentID }) else {
+                debugLog("cacheBackgroundTabs: parent window \(parentID) not found")
+                continue
+            }
+
+            let appName = parentWindow.appName
+            let pid = parentWindow.pid
+            let bundleId = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+
+            debugLog("cacheBackgroundTabs: processing \(tabs.count) tabs for \(appName)")
+
+            // Find the currently active tab (the one that matches the parent window title)
+            let originalActiveIndex = tabs.first { $0.window.title == parentWindow.title }?.index ?? 0
+
+            // Sort tabs by index for consistent processing order
+            let sortedTabs = tabs.sorted { $0.index < $1.index }
+
+            // Iterate through each background tab
+            for (tabWindow, tabIndex) in sortedTabs {
+                debugLog("cacheBackgroundTabs: switching to tab \(tabIndex) '\(tabWindow.title)'")
+
+                // Switch to the tab
+                let switched: Bool
+                if bundleId == "com.apple.Safari" || bundleId == "com.google.Chrome" || bundleId.contains("Chrome") {
+                    switched = selectTabViaAppleScript(appName: appName, pid: pid, tabTitle: tabWindow.title, tabIndex: tabIndex)
+                } else {
+                    switched = selectTabViaAX(pid: pid, tabIndex: tabIndex, tabTitle: tabWindow.title)
+                }
+
+                if !switched {
+                    debugLog("cacheBackgroundTabs: failed to switch to tab '\(tabWindow.title)'")
+                    continue
+                }
+
+                // Wait for the tab to render (250ms seems to work well)
+                try? await Task.sleep(nanoseconds: 250_000_000) // 250ms
+
+                // Capture the screenshot using the parent window ID (now showing this tab)
+                if let cgImage = captureWindowViaPrivateAPI(windowID: parentID, fullSize: true) {
+                    let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+                    let nsImage = NSImage(cgImage: cgImage, size: size)
+                    let cacheKey = tabCacheKey(pid: pid, title: tabWindow.title)
+                    setTabScreenshot(key: cacheKey, image: nsImage)
+                    debugLog("cacheBackgroundTabs: cached screenshot for '\(tabWindow.title)'")
+                } else {
+                    debugLog("cacheBackgroundTabs: failed to capture '\(tabWindow.title)'")
+                }
+            }
+
+            // Restore the original active tab
+            debugLog("cacheBackgroundTabs: restoring original tab index \(originalActiveIndex)")
+            if bundleId == "com.apple.Safari" || bundleId == "com.google.Chrome" || bundleId.contains("Chrome") {
+                _ = selectTabViaAppleScript(appName: appName, pid: pid, tabTitle: parentWindow.title, tabIndex: originalActiveIndex)
+            } else {
+                _ = selectTabViaAX(pid: pid, tabIndex: originalActiveIndex, tabTitle: parentWindow.title)
+            }
+        }
+
+        debugLog("cacheBackgroundTabs: finished caching")
+    }
+
+    /// Try to find and click a tab with the given title in the window's tab bar
+    /// targetIndex: which matching tab to click (0 = first, 1 = second, etc)
+    private func selectTabByTitle(in window: AXUIElement, title: String, targetIndex: Int) -> Bool {
+        debugLog("Looking for tab with title '\(title)' at index \(targetIndex)")
+
+        // Try to find the tab bar/tab group
+        var children: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &children) == .success,
+              let childElements = children as? [AXUIElement] else {
+            debugLog("Could not get window children")
+            return false
+        }
+
+        // Search recursively for tab-related elements
+        var matchCount = 0
+        let result = searchForTab(in: childElements, title: title, targetIndex: targetIndex, currentMatchCount: &matchCount, depth: 0)
+
+        if !result {
+            // Collect available tab titles for debugging
+            var availableTabs: [String] = []
+            collectTabTitles(in: childElements, into: &availableTabs, depth: 0)
+            if !availableTabs.isEmpty {
+                debugLog("Available tabs: \(availableTabs.joined(separator: ", "))")
+                debugLog("Found \(matchCount) matching tabs, needed index \(targetIndex)")
+            }
+        }
+
+        return result
+    }
+
+    /// Collect all tab titles from the AX hierarchy for debugging
+    private func collectTabTitles(in elements: [AXUIElement], into titles: inout [String], depth: Int) {
+        guard depth < 10 else { return }
+
+        for element in elements {
+            var roleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+            let role = roleRef as? String ?? ""
+
+            var titleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef)
+            let elementTitle = titleRef as? String ?? ""
+
+            if (role == "AXRadioButton" || role == "AXTab") && !elementTitle.isEmpty {
+                titles.append("'\(elementTitle)'")
+            }
+
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                collectTabTitles(in: children, into: &titles, depth: depth + 1)
+            }
+        }
+    }
+
+    private func searchForTab(in elements: [AXUIElement], title: String, targetIndex: Int, currentMatchCount: inout Int, depth: Int) -> Bool {
+        guard depth < 10 else { return false }  // Prevent infinite recursion
+
+        for element in elements {
+            // Get role
+            var roleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+            let role = roleRef as? String ?? ""
+
+            // Get title/description
+            var titleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef)
+            var descRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef)
+
+            let elementTitle = titleRef as? String ?? ""
+            let elementDesc = descRef as? String ?? ""
+
+            if depth < 3 {
+                debugLog("  \(String(repeating: "  ", count: depth))[\(role)] title='\(elementTitle)' desc='\(elementDesc)'")
+            }
+
+            // Check if this is a tab/radio button matching our title
+            if (role == "AXRadioButton" || role == "AXButton" || role == "AXTab") &&
+               !elementTitle.isEmpty && titlesMatch(wanted: title, tabTitle: elementTitle) {
+                // Found a matching tab - check if it's the one we want
+                if currentMatchCount == targetIndex {
+                    debugLog("Found matching tab '\(elementTitle)' at index \(currentMatchCount)! Clicking...")
+                    let result = AXUIElementPerformAction(element, kAXPressAction as CFString)
+                    debugLog("Click result: \(result.rawValue)")
+                    return result == .success
+                } else {
+                    debugLog("Found matching tab '\(elementTitle)' at index \(currentMatchCount), need index \(targetIndex), skipping")
+                    currentMatchCount += 1
+                }
+            }
+
+            // Recurse into children
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                if searchForTab(in: children, title: title, targetIndex: targetIndex, currentMatchCount: &currentMatchCount, depth: depth + 1) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    /// Match window title (potentially truncated with …) to AX tab title (full)
+    /// CGWindowList may report: "…/GitHub/ghostty/ghostty"
+    /// AX tabs report full: "~/git/ghostty/ghostty"
+    private func titlesMatch(wanted: String, tabTitle: String) -> Bool {
+        // Exact match
+        if wanted == tabTitle {
+            return true
+        }
+
+        // Handle ellipsis-truncated titles from CGWindowList
+        // "…/something" should match "~/path/to/something" (path ending)
+        if wanted.hasPrefix("…") {
+            let suffix = String(wanted.dropFirst()) // Remove …
+            // The tab title should end with this suffix
+            return tabTitle.hasSuffix(suffix)
+        }
+
+        // Handle path matching - compare the final path component(s)
+        // "~/git/ghostty/ghostty" should match tab "~/git/ghostty/ghostty"
+        // but NOT match "~" or other shorter paths
+
+        // If wanted is a path (contains /), require it to match exactly
+        // or the tab title to end with the same path segments
+        if wanted.contains("/") && tabTitle.contains("/") {
+            // Get last 2-3 path components and compare
+            let wantedComponents = wanted.split(separator: "/").suffix(3)
+            let tabComponents = tabTitle.split(separator: "/").suffix(3)
+
+            // If we have the same final components, it's a match
+            if wantedComponents == tabComponents {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func bringAppToFront(pid: pid_t) {
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return }
+
+        // Make sure the app is not hidden
+        if app.isHidden {
+            app.unhide()
+        }
+
+        // First, raise the frontmost window via AX (like Switch does)
+        let appElement = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let axWindows = windowsRef as? [AXUIElement],
+           let frontWindow = axWindows.first {
+            AXUIElementPerformAction(frontWindow, kAXRaiseAction as CFString)
+        }
+
+        // Then activate the app (this updates the menu bar)
+        app.activate()
+
+        // For setting AX attributes
+        let trueValue: CFTypeRef = kCFBooleanTrue
+
+        // Find the main content area (text area, scroll area, etc.) in a window
+        func findContentArea(in element: AXUIElement, depth: Int = 0) -> AXUIElement? {
+            guard depth < 8 else { return nil }
+
+            var roleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+            let role = roleRef as? String ?? ""
+
+            // These roles typically represent the main content area
+            if role == "AXTextArea" || role == "AXWebArea" || (role == "AXGroup" && depth > 2) {
+                return element
+            }
+
+            // Recurse into children
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                // Prefer larger children (main content is usually bigger)
+                for child in children {
+                    if let found = findContentArea(in: child, depth: depth + 1) {
+                        return found
+                    }
+                }
+            }
+            return nil
+        }
+
+        // Helper to ensure window has keyboard focus
+        func ensureFocus() {
+            var focusedWindow: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+               let axWindow = focusedWindow as! AXUIElement? {
+                // Raise the window
+                AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+
+                // Set it as main and focused
+                AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, trueValue)
+                AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, trueValue)
+
+                // Try to find and focus the content area directly
+                if let contentArea = findContentArea(in: axWindow) {
+                    var roleRef: CFTypeRef?
+                    AXUIElementCopyAttributeValue(contentArea, kAXRoleAttribute as CFString, &roleRef)
+                    debugLog("Found content area with role: \(roleRef as? String ?? "unknown")")
+                    AXUIElementSetAttributeValue(contentArea, kAXFocusedAttribute as CFString, trueValue)
+                } else {
+                    debugLog("No content area found, using focused element fallback")
+                    // Fallback: try to focus whatever is currently focused
+                    var focusedElement: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(axWindow, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success,
+                       let element = focusedElement as! AXUIElement? {
+                        var roleRef: CFTypeRef?
+                        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+                        debugLog("Focusing element with role: \(roleRef as? String ?? "unknown")")
+                        AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, trueValue)
+                    }
+                }
+            }
+
+            // Re-activate to ensure keyboard focus
+            app.activate()
+        }
+
+        // Multiple retry attempts with increasing delays
+        // Some apps need more time for their window state to settle after tab switches
+        let delays: [Double] = [0.05, 0.1, 0.2]
+        for delay in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                ensureFocus()
+            }
+        }
+    }
+
+    func moveWindow(_ windowID: UInt32, to point: CGPoint) {
+        var p = point
+        _ = SLSMoveWindow(cid, windowID, &p)
+    }
+
+    /// Raise window visually for cycling preview (no focus steal)
+    func raiseWindowForPreview(_ windowID: UInt32) {
+        guard let window = windows.first(where: { $0.windowID == windowID }) else { return }
+
+        // For background tabs, we need to switch to the tab first
+        if window.parentWindowID != nil {
+            let appElement = AXUIElementCreateApplication(window.pid)
+            var windowsRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+               let axWindows = windowsRef as? [AXUIElement] {
+                for axWindow in axWindows {
+                    if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.tabIndex) {
+                        break
+                    }
+                }
+            }
+        }
+
+        // Use private API to bring window to front without making it key
+        // This raises the window visually but doesn't steal keyboard focus
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(window.pid, &psn)
+
+        let targetWindowID = window.parentWindowID ?? windowID
+        // Use allWindows mode - brings process to front with all its windows
+        _SLPSSetFrontProcessWithOptions(&psn, targetWindowID, SLPSMode.allWindows.rawValue)
+    }
+
+    /// Switch to the space containing a window
+    func switchToSpaceForWindow(_ windowID: UInt32) -> Bool {
+        let cid = CGSMainConnectionID()
+        guard let displayUUID = getMainDisplayUUID() else {
+            debugLog("switchToSpaceForWindow: failed to get display UUID")
+            return false
+        }
+
+        // Get the space(s) this window belongs to
+        let windowArray = [windowID as CFNumber] as CFArray
+        let spaces = CGSCopySpacesForWindows(cid, 0x7, windowArray) // 0x7 = all spaces
+        guard let spaceIDs = spaces as? [CGSSpaceID], let targetSpace = spaceIDs.first else {
+            debugLog("switchToSpaceForWindow: failed to get space for window \(windowID)")
+            return false
+        }
+
+        // Check if we're already on the target space
+        let currentSpace = CGSManagedDisplayGetCurrentSpace(cid, displayUUID)
+        if currentSpace == targetSpace {
+            debugLog("switchToSpaceForWindow: already on space \(targetSpace)")
+            return true
+        }
+
+        // Switch to the target space
+        debugLog("switchToSpaceForWindow: switching from space \(currentSpace) to \(targetSpace)")
+        CGSManagedDisplaySetCurrentSpace(cid, displayUUID, targetSpace)
+        return true
+    }
+
+    /// Focus a window, switching spaces if necessary.
+    ///
+    /// Uses alt-tab's proven focus sequence with private SkyLight APIs:
+    /// 1. `_SLPSSetFrontProcessWithOptions` with `userGenerated` mode (0x200)
+    ///    - Brings the process to front and signals user intent for space switch
+    /// 2. `makeKeyWindow` via `SLPSPostEventRecordTo`
+    ///    - Sends binary protocol to WindowServer to make the window key
+    /// 3. `AXUIElementPerformAction(element, kAXRaiseAction)`
+    ///    - This is the crucial step that actually triggers space switching
+    ///
+    /// For windows on other spaces, the normal AX API can't find them, so we use
+    /// `findAXUIElement(forWindowID:pid:)` to brute-force discover the element.
+    func focusWindow(_ windowID: UInt32) {
+        guard let window = windows.first(where: { $0.windowID == windowID }) else {
+            debugLog("focusWindow: window \(windowID) not found")
+            return
+        }
+
+        debugLog("focusWindow: \(window.appName) '\(window.title)' isOnCurrentSpace=\(window.isOnCurrentSpace) parentWindowID=\(window.parentWindowID?.description ?? "nil") tabIndex=\(window.tabIndex)")
+
+        let targetWindowID = window.parentWindowID ?? windowID
+
+        // Handle background tabs first - switch to the correct tab
+        let isBackgroundTab = window.parentWindowID != nil
+        if isBackgroundTab {
+            debugLog("focusWindow: this is a background tab (index \(window.tabIndex)), trying to switch")
+            // Try AppleScript first (more reliable for Terminal, Safari, etc.)
+            let tabSwitchResult = selectTabViaAppleScript(
+                appName: window.appName,
+                pid: window.pid,
+                tabTitle: window.title,
+                tabIndex: window.tabIndex
+            )
+            debugLog("focusWindow: tab switch via AppleScript returned \(tabSwitchResult)")
+            if !tabSwitchResult {
+                // Fall back to AX approach if AppleScript didn't work
+                debugLog("focusWindow: AppleScript failed, trying AX fallback")
+                let appElement = AXUIElementCreateApplication(window.pid)
+                var windowsRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+                   let axWindows = windowsRef as? [AXUIElement] {
+                    for axWindow in axWindows {
+                        if selectTabByTitle(in: axWindow, title: window.title, targetIndex: window.tabIndex) {
+                            break
+                        }
+                    }
+                }
+            }
+
+            // For background tabs on current space, the tab click already focused the window.
+            // Skip the full window activation sequence which can revert the tab selection.
+            if window.isOnCurrentSpace {
+                debugLog("focusWindow: background tab on current space, skipping window activation (tab click handled it)")
+                return
+            }
+        }
+
+        // Use alt-tab's proven focus sequence:
+        // 1. SLPSSetFrontProcessWithOptions with userGenerated mode
+        //    - This brings the process to front AND triggers space switch if needed
+        // 2. makeKeyWindow via SLPSPostEventRecordTo
+        //    - Ensures the specific window becomes key
+        // 3. AXRaise to ensure proper z-order
+
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(window.pid, &psn)
+
+        debugLog("focusWindow: calling _SLPSSetFrontProcessWithOptions with userGenerated mode")
+        _SLPSSetFrontProcessWithOptions(&psn, targetWindowID, SLPSMode.userGenerated.rawValue)
+
+        debugLog("focusWindow: calling makeKeyWindow")
+        makeKeyWindow(&psn, targetWindowID)
+
+        // Raise via AX API - need to find the AXUIElement for this window
+        // For windows on other spaces, the normal AX API won't return them,
+        // so we use alt-tab's brute-force approach with _AXUIElementCreateWithRemoteToken
+        var targetAxElement: AXUIElement? = nil
+
+        // First try the normal approach (faster, works for current-space windows)
+        let appElement = AXUIElementCreateApplication(window.pid)
+        var windowsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let axWindows = windowsRef as? [AXUIElement] {
+            for axWindow in axWindows {
+                var windowIDRef: UInt32 = 0
+                if _AXUIElementGetWindow(axWindow, &windowIDRef) == .success,
+                   windowIDRef == targetWindowID {
+                    targetAxElement = axWindow
+                    debugLog("focusWindow: found AXUIElement via normal API")
+                    break
+                }
+            }
+        }
+
+        // If not found, use brute-force approach for other-space windows
+        if targetAxElement == nil && !window.isOnCurrentSpace {
+            debugLog("focusWindow: window not on current space, using brute-force AXUIElement discovery")
+            targetAxElement = findAXUIElement(forWindowID: targetWindowID, pid: window.pid)
+            if targetAxElement != nil {
+                debugLog("focusWindow: found AXUIElement via brute-force")
+            } else {
+                debugLog("focusWindow: brute-force failed to find AXUIElement")
+            }
+        }
+
+        // Perform AXRaise
+        if let axElement = targetAxElement {
+            debugLog("focusWindow: performing AXRaise")
+            AXUIElementPerformAction(axElement, kAXRaiseAction as CFString)
+        } else {
+            debugLog("focusWindow: no AXUIElement found, skipping AXRaise")
+        }
+    }
+}
