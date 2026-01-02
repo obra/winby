@@ -3881,8 +3881,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var previewWindow: NSWindow?
     var statusItem: NSStatusItem?
     var statusMenu: NSMenu?
-    // Don't auto-start updater - wait until after onboarding completes
-    let updaterController = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    // Updater is only available in proper app bundles with SUFeedURL configured
+    lazy var updaterController: SPUStandardUpdaterController? = {
+        guard Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil else {
+            debugLog("Sparkle disabled: no SUFeedURL in bundle (local dev build?)")
+            return nil
+        }
+        return SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    }()
 
     // Event tap for Cmd+Tab interception
     private var eventTap: CFMachPort?
@@ -4028,7 +4034,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             // Start the updater (we delay it during onboarding)
-            updaterController.startUpdater()
+            updaterController?.startUpdater()
         }
     }
 
@@ -4113,9 +4119,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "Show Winby (\(AppConfig.shared.hotkeyDescription))", action: #selector(toggleSidebar), keyEquivalent: "")
         menu.addItem(.separator())
-        let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
-        updateItem.target = updaterController
-        menu.addItem(updateItem)
+        if let controller = updaterController {
+            let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "")
+            updateItem.target = controller
+            menu.addItem(updateItem)
+        }
         menu.addItem(withTitle: "Preferences...", action: #selector(showSettings), keyEquivalent: ",")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit Winby", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -4196,7 +4204,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupGlobalHotkey()
 
         // Now start the updater (we delayed it to avoid errors during onboarding)
-        updaterController.startUpdater()
+        updaterController?.startUpdater()
     }
 
     @objc func debugDumpContent() {
