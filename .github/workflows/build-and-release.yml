@@ -302,6 +302,29 @@ jobs:
         SIGNATURE_ATTRS=$(.build/artifacts/sparkle/Sparkle/bin/sign_update "$DMG_NAME" -f /tmp/sparkle_private_key)
         rm /tmp/sparkle_private_key
 
+        # Extract release notes for this version from CHANGELOG.md
+        # Gets content between ## [VERSION] and the next ## [
+        RELEASE_NOTES=$(awk -v ver="$VERSION" '
+          /^## \[/ { if (found) exit; if ($0 ~ "\\[" ver "\\]") found=1; next }
+          found { print }
+        ' CHANGELOG.md | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+
+        # Convert markdown to simple HTML
+        RELEASE_NOTES_HTML=$(echo "$RELEASE_NOTES" | awk '
+          /^### / { if (in_list) { print "</ul>"; in_list=0 } gsub(/^### /, ""); print "<h3>" $0 "</h3>"; next }
+          /^- \*\*.*\*\*:/ {
+            if (in_list == 0) { print "<ul>"; in_list=1 }
+            gsub(/^- \*\*/, "<li><strong>"); gsub(/\*\*:/, "</strong>:")
+            print $0 "</li>"; next
+          }
+          /^- / {
+            if (in_list == 0) { print "<ul>"; in_list=1 }
+            gsub(/^- /, "<li>"); print $0 "</li>"; next
+          }
+          /^$/ { if (in_list) { print "</ul>"; in_list=0 } next }
+          END { if (in_list) print "</ul>" }
+        ')
+
         # Create appcast.xml
         cat > appcast.xml << EOF
         <?xml version="1.0" encoding="utf-8"?>
@@ -313,6 +336,7 @@ jobs:
             <language>en</language>
             <item>
               <title>Version $VERSION</title>
+              <description><![CDATA[$RELEASE_NOTES_HTML]]></description>
               <pubDate>$(date -R)</pubDate>
               <sparkle:version>${{ github.run_number }}</sparkle:version>
               <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>

@@ -107,12 +107,22 @@ class WindowManager: ObservableObject {
 
     init() {
         cid = SLSMainConnectionID()
-        refresh()
+        // Don't start refreshing until sidebar is shown - saves CPU when idle
+    }
 
-        // Refresh window list periodically
+    /// Start the refresh timer - call when sidebar becomes visible
+    func startRefreshing() {
+        guard refreshTimer == nil else { return }
+        refresh()  // Get fresh data immediately
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+    }
+
+    /// Stop the refresh timer - call when sidebar is hidden
+    func stopRefreshing() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
     }
 
     // Apps to completely hide from the window list (system UI, etc.)

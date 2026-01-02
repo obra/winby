@@ -45,8 +45,9 @@ extension AppDelegate {
             display: false
         )
 
-        // Select the current window (first in list) when sidebar opens
+        // Start refreshing and select the current window when sidebar opens
         let manager = WindowManager.shared
+        manager.startRefreshing()
         manager.sidebarVisible = true
         if let firstWindow = manager.windows.first {
             manager.selectedWindowID = firstWindow.windowID
@@ -102,10 +103,11 @@ extension AppDelegate {
             globalClickMonitor = nil
         }
 
-        // Clear cycling state
+        // Clear cycling state and stop refreshing
         isTabCycling = false
         WindowManager.shared.isCycling = false
         WindowManager.shared.sidebarVisible = false
+        WindowManager.shared.stopRefreshing()
 
         // Re-enable system hotkeys
         _ = CGSSetGlobalHotKeyOperatingMode(SLSMainConnectionID(), 0)  // 0 = enable

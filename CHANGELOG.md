@@ -2,6 +2,14 @@
 
 All notable changes to Winby will be documented in this file.
 
+## [1.3.1] - 2026-01-02
+
+### Fixed
+- High CPU usage when app is idle (window refresh timer now only runs when sidebar is visible)
+
+### Added
+- Release notes shown in Sparkle update dialog (parsed from CHANGELOG.md)
+
 ## [1.3.0] - 2026-01-02
 
 ### Added
