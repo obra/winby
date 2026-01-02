@@ -2,10 +2,15 @@
 
 All notable changes to Winby will be documented in this file.
 
+## [1.2.2] - 2026-01-01
+
+### Fixed
+- Auto-updater appcast XML parsing (signature attributes were malformed)
+
 ## [1.2.1] - 2026-01-01
 
 ### Fixed
-- Auto-updater now works correctly (public key was malformed in previous releases)
+- Auto-updater public key in release builds
 - No more "updater failed to start" error when running local dev builds
 
 ## [1.2.0] - 2026-01-01

@@ -296,12 +296,10 @@ jobs:
         VERSION="${VERSION#v}"
         DMG_NAME="Winby-${VERSION}.dmg"
 
-        # Get file size and generate signature
-        FILE_SIZE=$(stat -f%z "$DMG_NAME")
-
         # Generate EdDSA signature using Sparkle's sign_update tool
+        # sign_update outputs: sparkle:edSignature="..." length="..."
         echo "$SPARKLE_PRIVATE_KEY" > /tmp/sparkle_private_key
-        SIGNATURE=$(.build/artifacts/sparkle/Sparkle/bin/sign_update "$DMG_NAME" -f /tmp/sparkle_private_key)
+        SIGNATURE_ATTRS=$(.build/artifacts/sparkle/Sparkle/bin/sign_update "$DMG_NAME" -f /tmp/sparkle_private_key)
         rm /tmp/sparkle_private_key
 
         # Create appcast.xml
@@ -320,8 +318,7 @@ jobs:
               <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
               <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
               <enclosure url="https://github.com/obra/winby/releases/download/v$VERSION/$DMG_NAME"
-                         sparkle:edSignature="$SIGNATURE"
-                         length="$FILE_SIZE"
+                         $SIGNATURE_ATTRS
                          type="application/octet-stream"/>
             </item>
           </channel>
