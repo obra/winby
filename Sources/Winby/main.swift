@@ -3601,39 +3601,142 @@ struct SidebarView: View {
     }
 }
 
+// MARK: - Resize Handle
+
+struct ResizeHandle: View {
+    @Binding var isResizing: Bool
+    let aspectRatio: CGFloat
+    @State private var dragStartLocation: NSPoint = .zero
+    @State private var initialFrame: NSRect = .zero
+
+    var body: some View {
+        Image(systemName: "arrow.up.left.and.arrow.down.right")
+            .font(.system(size: 12, weight: .medium))
+            .foregroundColor(.white.opacity(0.8))
+            .padding(6)
+            .background(Circle().fill(Color.black.opacity(0.4)))
+            .padding(8)
+            .contentShape(Rectangle().size(width: 44, height: 44))
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        guard let window = (NSApp.delegate as? AppDelegate)?.previewWindow else { return }
+
+                        if !isResizing {
+                            isResizing = true
+                            dragStartLocation = NSEvent.mouseLocation
+                            initialFrame = window.frame
+                        }
+
+                        // Calculate delta from drag start using screen coordinates
+                        let currentMouse = NSEvent.mouseLocation
+                        let deltaX = currentMouse.x - dragStartLocation.x
+                        let deltaY = currentMouse.y - dragStartLocation.y
+
+                        // Use the larger delta to drive resize, maintain aspect ratio
+                        let widthFromDeltaX = initialFrame.width + deltaX
+                        let widthFromDeltaY = (initialFrame.height - deltaY) * aspectRatio
+
+                        // Pick the dimension that gives larger size
+                        var newWidth = max(widthFromDeltaX, widthFromDeltaY)
+                        newWidth = max(200, newWidth)
+                        let newHeight = newWidth / aspectRatio
+
+                        // Keep top-left corner fixed
+                        let topY = initialFrame.origin.y + initialFrame.height
+                        let newY = topY - newHeight
+
+                        window.setFrame(
+                            NSRect(x: initialFrame.origin.x, y: newY, width: newWidth, height: newHeight),
+                            display: true
+                        )
+                    }
+                    .onEnded { _ in
+                        isResizing = false
+                    }
+            )
+            .opacity(isResizing ? 1 : 0.7)
+            .onHover { hovering in
+                if hovering {
+                    NSCursor(image: NSImage(systemSymbolName: "arrow.up.left.and.arrow.down.right", accessibilityDescription: nil)!, hotSpot: NSPoint(x: 8, y: 8)).push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+    }
+}
+
 // MARK: - Preview Panel View
 
 struct PreviewPanelView: View {
     @ObservedObject var manager = WindowManager.shared
     @State private var previewImage: NSImage?
+    @State private var displayedImage: NSImage?  // For crossfade animation
     @State private var loadingTask: Task<Void, Never>?
-
-    private let padding: CGFloat = 12
+    @State private var isHovering = false
+    @State private var isDraggingWindow = false
+    @State private var isResizing = false
+    @State private var imageAspectRatio: CGFloat = 16.0 / 9.0
+    @State private var dragStartLocation: NSPoint = .zero
 
     var body: some View {
-        ZStack {
-            if let image = previewImage {
+        GeometryReader { geometry in
+            if let image = displayedImage {
                 Image(nsImage: image)
                     .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .padding(padding)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        // Focus the selected window
-                        if let windowID = manager.selectedWindowID {
-                            manager.bringToFront(windowID)
-                            if let appDelegate = NSApp.delegate as? AppDelegate {
-                                appDelegate.didSelectWindow = true
-                                appDelegate.hideSidebar()
-                            }
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .overlay(alignment: .bottomTrailing) {
+                        // Resize handle overlaid on the image itself
+                        if isHovering || isResizing {
+                            ResizeHandle(isResizing: $isResizing, aspectRatio: imageAspectRatio)
                         }
                     }
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                // Don't move window while resizing
+                                guard !isResizing else { return }
+                                guard let window = (NSApp.delegate as? AppDelegate)?.previewWindow else { return }
+                                if !isDraggingWindow {
+                                    isDraggingWindow = true
+                                    dragStartLocation = NSEvent.mouseLocation
+                                }
+                                // Move window based on mouse delta
+                                let currentMouse = NSEvent.mouseLocation
+                                let deltaX = currentMouse.x - dragStartLocation.x
+                                let deltaY = currentMouse.y - dragStartLocation.y
+                                let currentFrame = window.frame
+                                window.setFrameOrigin(NSPoint(
+                                    x: currentFrame.origin.x + deltaX,
+                                    y: currentFrame.origin.y + deltaY
+                                ))
+                                dragStartLocation = currentMouse
+                            }
+                            .onEnded { _ in
+                                isDraggingWindow = false
+                            }
+                    )
+                    .simultaneousGesture(
+                        TapGesture()
+                            .onEnded {
+                                // Focus the selected window
+                                if let windowID = manager.selectedWindowID {
+                                    manager.bringToFront(windowID)
+                                    if let appDelegate = NSApp.delegate as? AppDelegate {
+                                        appDelegate.didSelectWindow = true
+                                        appDelegate.hideSidebar()
+                                    }
+                                }
+                            }
+                    )
+                    .id(displayedImage)  // Force view recreation for transition
+                    .transition(.opacity)
             } else {
                 // Show app icon as placeholder while loading
                 if let windowID = manager.selectedWindowID,
                    let window = manager.windows.first(where: { $0.windowID == windowID }),
-                   let app = NSRunningApplication(processIdentifier: window.pid),
-                   let icon = app.icon {
+                   let icon = window.appIcon {
                     Image(nsImage: icon)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
@@ -3645,29 +3748,33 @@ struct PreviewPanelView: View {
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeInOut(duration: 0.25), value: displayedImage)
+        .onHover { hovering in
+            isHovering = hovering
+        }
         .onChange(of: manager.selectedWindowID) { _, newValue in
             loadPreview(for: newValue)
+        }
+        .onChange(of: previewImage) { _, newImage in
+            // Resize window to fit new image, then crossfade
+            if let image = newImage {
+                resizeWindowToFitImage(image)
+                imageAspectRatio = image.size.width / image.size.height
+            }
+            displayedImage = newImage
         }
         .onAppear {
             loadPreview(for: manager.selectedWindowID)
         }
     }
 
-    private func resizeWindowToFit(_ image: NSImage?) {
-        debugLog("resizeWindowToFit called, image=\(image != nil)")
-        guard let image = image,
-              let appDelegate = NSApp.delegate as? AppDelegate,
-              let window = appDelegate.previewWindow else {
-            debugLog("resizeWindowToFit: guard failed - appDelegate=\(NSApp.delegate != nil), previewWindow=\((NSApp.delegate as? AppDelegate)?.previewWindow != nil)")
-            return
-        }
+    private func resizeWindowToFitImage(_ image: NSImage) {
+        guard let window = (NSApp.delegate as? AppDelegate)?.previewWindow else { return }
 
         let imageSize = image.size
-        debugLog("resizeWindowToFit: imageSize=\(imageSize)")
         guard imageSize.width > 0 && imageSize.height > 0 else { return }
 
-        // Calculate target size - fit within screen with max dimensions
+        // Calculate target size - fit within screen bounds
         let screen = window.screen ?? NSScreen.main ?? NSScreen.screens.first!
         let maxWidth = screen.visibleFrame.width * 0.6
         let maxHeight = screen.visibleFrame.height * 0.7
@@ -3686,20 +3793,19 @@ struct PreviewPanelView: View {
             targetWidth = targetHeight * imageAspect
         }
 
-        // Add padding
-        targetWidth += padding * 2
-        targetHeight += padding * 2
+        // Ensure minimum size
+        targetWidth = max(200, targetWidth)
+        targetHeight = max(150, targetHeight)
 
-        // Resize window, keeping center position
+        // Keep top-left corner fixed
         let currentFrame = window.frame
-        let newFrame = NSRect(
-            x: currentFrame.midX - targetWidth / 2,
-            y: currentFrame.midY - targetHeight / 2,
-            width: targetWidth,
-            height: targetHeight
+        let topY = currentFrame.origin.y + currentFrame.height
+        let newY = topY - targetHeight
+
+        window.setFrame(
+            NSRect(x: currentFrame.origin.x, y: newY, width: targetWidth, height: targetHeight),
+            display: true
         )
-        debugLog("resizeWindowToFit: currentFrame=\(currentFrame), newFrame=\(newFrame)")
-        window.setFrame(newFrame, display: true, animate: true)
     }
 
     private func loadPreview(for windowID: UInt32?) {
@@ -3728,7 +3834,6 @@ struct PreviewPanelView: View {
             if !Task.isCancelled {
                 await MainActor.run {
                     previewImage = image  // Will be nil if capture failed
-                    resizeWindowToFit(image)
                 }
             }
         }
@@ -3972,12 +4077,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         previewWindow = previewPanel
 
-        previewPanel.isMovableByWindowBackground = true
+        previewPanel.isMovableByWindowBackground = false  // We handle dragging in SwiftUI
         previewPanel.becomesKeyOnlyIfNeeded = true
         previewPanel.hidesOnDeactivate = false
         previewPanel.isOpaque = false
         previewPanel.backgroundColor = .clear
-        previewPanel.hasShadow = true
+        previewPanel.hasShadow = false  // No border/shadow around the preview
         previewPanel.level = .popUpMenu
         previewPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         previewPanel.minSize = NSSize(width: 200, height: 150)
@@ -3985,27 +4090,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Persist window position/size across restarts
         previewPanel.setFrameAutosaveName("WinbyPreviewWindow")
 
-        // Add visual effect background
-        let visualEffect = NSVisualEffectView()
-        visualEffect.material = .hudWindow
-        visualEffect.state = .active
-        visualEffect.blendingMode = .behindWindow
-        visualEffect.wantsLayer = true
-        visualEffect.layer?.cornerRadius = 12
-        visualEffect.layer?.masksToBounds = true
-
+        // No background - just the screenshot with shadow
         let hostingView = NSHostingView(rootView: PreviewPanelView())
-        hostingView.translatesAutoresizingMaskIntoConstraints = false
-
-        visualEffect.addSubview(hostingView)
-        NSLayoutConstraint.activate([
-            hostingView.topAnchor.constraint(equalTo: visualEffect.topAnchor),
-            hostingView.bottomAnchor.constraint(equalTo: visualEffect.bottomAnchor),
-            hostingView.leadingAnchor.constraint(equalTo: visualEffect.leadingAnchor),
-            hostingView.trailingAnchor.constraint(equalTo: visualEffect.trailingAnchor)
-        ])
-
-        previewPanel.contentView = visualEffect
+        previewPanel.contentView = hostingView
 
         // Only set default position if no saved frame exists
         if !previewPanel.setFrameUsingName("WinbyPreviewWindow") {
