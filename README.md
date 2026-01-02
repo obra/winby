@@ -1,6 +1,6 @@
 # Winby
 
-A fast, keyboard-driven window switcher for macOS. Search by window title, app name, or even text visible inside your windows.
+A keyboard-driven window switcher for macOS. Search by window title, app name, or text visible inside your windows.
 
 ![Winby Screenshot](docs/screenshot-sidebar.png)
 
@@ -10,13 +10,13 @@ A fast, keyboard-driven window switcher for macOS. Search by window title, app n
 Type to filter windows by title or application name. Fuzzy matching finds what you need even with partial or out-of-order characters.
 
 ### Live Window Previews
-See thumbnails of every window before switching. The preview panel shows a larger view of the currently selected window so you know exactly where you're going.
+See thumbnails of every window before switching. The preview panel shows a larger view of the currently selected window.
 
 ### Content Search (OCR)
-Search by text visible in your windows using optical character recognition. Find that terminal, document, or browser tab by what's actually displayed in it—not just the window title.
+Search by text visible in your windows using optical character recognition. Find that terminal, document, or browser tab by what's displayed in it.
 
 ### Tab Support
-Winby detects tabs in applications like Terminal, Safari, and others. Each tab appears as a separate entry in the window list, so you can jump directly to a specific tab.
+Winby detects tabs in Terminal, Safari, and other tabbed applications. Each tab appears as a separate entry in the window list, so you can jump directly to a specific tab.
 
 ### Keyboard-First Design
 Navigate entirely with your keyboard:
@@ -26,10 +26,10 @@ Navigate entirely with your keyboard:
 - **Type**: Filter the window list
 
 ### Customizable Hotkey
-Set any keyboard shortcut to activate Winby. The default is `⌘⇧Space`, but you can configure it to `⌘Tab` to replace the system app switcher entirely.
+Set any keyboard shortcut to activate Winby. The default is `⌘⇧Space`, but you can configure it to `⌘Tab` to replace the system app switcher.
 
 ### Launch at Login
-Start Winby automatically when you log in. It lives quietly in your menu bar until you need it.
+Start Winby automatically when you log in. It lives in your menu bar until you need it.
 
 ## Installation
 
