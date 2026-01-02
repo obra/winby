@@ -140,12 +140,39 @@ Window thumbnails are captured using `CGWindowListCreateImage` for on-screen win
 
 ## Privacy
 
-Winby runs entirely locally. It does not:
-- Send any data to external servers (except Sparkle update checks to GitHub)
-- Store window content persistently
-- Access any data beyond what's needed for window switching
+Winby is designed with privacy as a core principle. **It makes no network connections and writes nothing to disk.**
 
-OCR results and thumbnails are cached in memory only and cleared when windows close or the app quits.
+### No Network Connections
+
+Winby never connects to the internet. The only exception is the optional Sparkle update checker, which contacts GitHub to check for new versions. All window switching, search, and OCR functionality is completely offline.
+
+### Nothing Written to Disk
+
+All caches are in-memory only:
+- **Thumbnails**: Cached in RAM, cleared when windows close or the app quits
+- **OCR results**: Cached in RAM, never persisted
+- **Screenshots**: Never saved to disk, only held temporarily in memory
+
+The only file Winby writes is `/tmp/wm_debug.log` when Debug Mode is enabled, and this contains only text logs (no images or window content).
+
+### On-Device OCR
+
+Content search uses Apple's Vision framework for optical character recognition. All OCR processing happens entirely on your device—no text is ever sent to any server.
+
+### Sensitive App Protection
+
+Password managers and other sensitive applications receive special handling:
+- **1Password, Bitwarden, Keychain Access, and Passwords** appear in the window list so you can switch to them
+- **No screenshots are captured** for these apps—Winby shows a placeholder image instead
+- This prevents sensitive content from being visible in previews or cached in memory
+
+### Minimal Data Access
+
+Winby only accesses:
+- Window titles and positions (via Accessibility API)
+- Window screenshots (via Screen Recording permission, for thumbnails and OCR)
+
+It does not access files, clipboard, keystrokes, or any other system data.
 
 ## Automatic Updates
 
