@@ -2,6 +2,21 @@
 
 All notable changes to Winby will be documented in this file.
 
+## [1.3.0] - 2026-01-02
+
+### Added
+- **Privacy protection for password managers**: 1Password, Bitwarden, Keychain Access, and Passwords are shown in the window list but never screenshotted or introspected
+- **Comprehensive privacy documentation**: New Privacy section in README and website explaining offline operation, on-device OCR, and sensitive app handling
+
+### Changed
+- Refactored codebase into well-organized extension files for better maintainability
+- Split hidden apps (completely invisible) from sensitive apps (visible but protected)
+
+### Security
+- Screenshots, thumbnails, and OCR never captured for password manager windows
+- AX accessibility introspection blocked for sensitive apps
+- Content indexing skips all sensitive apps entirely
+
 ## [1.2.2] - 2026-01-01
 
 ### Fixed
