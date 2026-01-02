@@ -150,12 +150,18 @@ class WindowManager: ObservableObject {
 
     /// Check if a window belongs to a sensitive app that should not be screenshotted
     func isSensitiveApp(pid: pid_t, appName: String) -> Bool {
-        if Self.sensitiveAppNames.contains(appName) {
+        let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+        let nameMatch = Self.sensitiveAppNames.contains(appName)
+        let bundleMatch = Self.sensitiveBundleIDs.contains(bundleID)
+        if nameMatch || bundleMatch {
+            debugLog("isSensitiveApp: '\(appName)' bundle='\(bundleID)' -> YES (name=\(nameMatch) bundle=\(bundleMatch))")
             return true
         }
-        if let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
-           Self.sensitiveBundleIDs.contains(bundleID) {
-            return true
+        // Log near-misses to help debug
+        if appName.contains("1Password") || appName.contains("Bitwarden") ||
+           appName.contains("Keychain") || appName.contains("Passwords") ||
+           bundleID.contains("1password") || bundleID.contains("bitwarden") {
+            debugLog("isSensitiveApp: NEAR MISS '\(appName)' bundle='\(bundleID)' -> NO")
         }
         return false
     }

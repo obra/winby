@@ -469,6 +469,19 @@ struct SidebarView: View {
     /// Capture a single thumbnail using provided SCWindow (avoids repeated SCShareableContent calls)
     /// Also caches the full-size image for instant preview loading
     func captureThumbnail(window: WindowInfo, scWindow: SCWindow?, maxSize: CGSize) async -> NSImage? {
+        // For sensitive apps (password managers), return placeholder instead of real screenshot
+        if manager.isSensitiveApp(pid: window.pid, appName: window.appName) {
+            let appIcon = NSRunningApplication(processIdentifier: window.pid)?.icon
+            let aspectRatio = window.frame.width / window.frame.height
+            let placeholderSize: CGSize
+            if aspectRatio > maxSize.width / maxSize.height {
+                placeholderSize = CGSize(width: maxSize.width, height: maxSize.width / aspectRatio)
+            } else {
+                placeholderSize = CGSize(width: maxSize.height * aspectRatio, height: maxSize.height)
+            }
+            return manager.generatePlaceholderWindow(title: window.title, appIcon: appIcon, size: placeholderSize)
+        }
+
         // For background tabs, check tab screenshot cache first
         if window.parentWindowID != nil {
             let cacheKey = manager.tabCacheKey(pid: window.pid, title: window.title)

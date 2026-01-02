@@ -280,6 +280,12 @@ extension WindowManager {
     /// Get text content from a window (searches for AXTextArea, AXStaticText, AXWebArea, etc.)
     /// Returns up to maxChars of content for search purposes
     func getWindowContent(windowID: UInt32, pid: pid_t, maxChars: Int = 5000) -> String? {
+        // Skip AX introspection for sensitive apps (password managers)
+        let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? ""
+        if isSensitiveApp(pid: pid, appName: appName) {
+            return nil
+        }
+
         // First, enable accessibility for Electron/Chrome apps
         enableAppAccessibility(pid: pid)
 

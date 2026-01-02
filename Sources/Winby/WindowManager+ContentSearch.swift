@@ -94,6 +94,11 @@ extension WindowManager {
             return nil
         }
 
+        // Skip OCR for sensitive apps (password managers)
+        if isSensitiveApp(pid: window.pid, appName: window.appName) {
+            return nil
+        }
+
         let cacheKey = tabCacheKey(pid: window.pid, title: window.title)
 
         // For background tabs, check tabOcrCache first
@@ -185,9 +190,14 @@ extension WindowManager {
         let refreshInterval: TimeInterval = 10  // Re-index on-screen windows every 10 seconds
 
         // Index windows that:
-        // 1. Have no content and haven't failed, OR
-        // 2. Are on-screen and haven't been indexed recently (content may have changed)
+        // 1. Are not sensitive apps (password managers), AND
+        // 2. Have no content and haven't failed, OR
+        // 3. Are on-screen and haven't been indexed recently (content may have changed)
         let windowsCopy = windows.filter { window in
+            // Skip sensitive apps entirely
+            if isSensitiveApp(pid: window.pid, appName: window.appName) {
+                return false
+            }
             if contentCache[window.windowID] == nil && !contentFailed.contains(window.windowID) {
                 return true  // Never indexed
             }
