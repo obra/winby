@@ -2,11 +2,6 @@ import Cocoa
 import SwiftUI
 import ScreenCaptureKit
 import Vision
-import KeyboardShortcuts
-import Sparkle
-import ServiceManagement
-import Carbon.HIToolbox
-
 
 // MARK: - Window Manager
 
