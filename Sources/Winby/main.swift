@@ -7,12 +7,6 @@ import Sparkle
 import ServiceManagement
 import Carbon.HIToolbox
 
-// MARK: - Keyboard Shortcuts
-
-extension KeyboardShortcuts.Name {
-    static let toggleWinby = Self("toggleWinby", default: .init(.space, modifiers: [.command, .shift]))
-}
-
 // MARK: - Configuration
 
 class AppConfig: ObservableObject {
