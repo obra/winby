@@ -12,7 +12,7 @@ class WindowManager: ObservableObject {
     @Published var selectedWindowID: UInt32? = nil
     @Published var sidebarResetTrigger: Bool = false  // Toggle to reset sidebar state
 
-    private let cid: Int32
+    let cid: Int32  // Internal for extensions
     private var refreshTimer: Timer?
     var isCycling = false  // When true, don't reorder windows during refresh
     var sidebarVisible = false  // When true, preserve window order during refresh
@@ -2043,10 +2043,6 @@ class WindowManager: ObservableObject {
         }
     }
 
-    func moveWindow(_ windowID: UInt32, to point: CGPoint) {
-        var p = point
-        _ = SLSMoveWindow(cid, windowID, &p)
-    }
 
     /// Raise window visually for cycling preview (no focus steal)
     func raiseWindowForPreview(_ windowID: UInt32) {
@@ -2076,34 +2072,6 @@ class WindowManager: ObservableObject {
         _SLPSSetFrontProcessWithOptions(&psn, targetWindowID, SLPSMode.allWindows.rawValue)
     }
 
-    /// Switch to the space containing a window
-    func switchToSpaceForWindow(_ windowID: UInt32) -> Bool {
-        let cid = CGSMainConnectionID()
-        guard let displayUUID = getMainDisplayUUID() else {
-            debugLog("switchToSpaceForWindow: failed to get display UUID")
-            return false
-        }
-
-        // Get the space(s) this window belongs to
-        let windowArray = [windowID as CFNumber] as CFArray
-        let spaces = CGSCopySpacesForWindows(cid, 0x7, windowArray) // 0x7 = all spaces
-        guard let spaceIDs = spaces as? [CGSSpaceID], let targetSpace = spaceIDs.first else {
-            debugLog("switchToSpaceForWindow: failed to get space for window \(windowID)")
-            return false
-        }
-
-        // Check if we're already on the target space
-        let currentSpace = CGSManagedDisplayGetCurrentSpace(cid, displayUUID)
-        if currentSpace == targetSpace {
-            debugLog("switchToSpaceForWindow: already on space \(targetSpace)")
-            return true
-        }
-
-        // Switch to the target space
-        debugLog("switchToSpaceForWindow: switching from space \(currentSpace) to \(targetSpace)")
-        CGSManagedDisplaySetCurrentSpace(cid, displayUUID, targetSpace)
-        return true
-    }
 
     /// Focus a window, switching spaces if necessary.
     ///
