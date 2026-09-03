@@ -145,60 +145,109 @@ extension WindowManager {
         return (tabs, selectedIndex)
     }
 
-    /// Get browser tabs via AppleScript (Safari, Chrome, Arc have native scripting support)
-    /// Returns (tabTitles, selectedIndex) or nil if not a supported browser
-    func getBrowserTabs(bundleId: String, appName: String) -> (titles: [String], selectedIndex: Int)? {
-        var script: String?
+    /// Serial queue for AppleScript execution. NSAppleScript is not thread safe, so all
+    /// sends share one queue; `qos: .utility` keeps them off the main thread entirely.
+    private static let browserScriptQueue = DispatchQueue(
+        label: "com.winby.browser-tab-discovery",
+        qos: .utility
+    )
 
-        if bundleId == "com.apple.Safari" || appName == "Safari" {
-            script = """
-            tell application "Safari"
-                set tabInfo to {}
-                set selectedIdx to -1
-                repeat with w in windows
-                    set tabCount to count of tabs of w
-                    set currentTab to current tab of w
-                    repeat with i from 1 to tabCount
-                        set t to tab i of w
-                        set tabName to name of t
-                        set end of tabInfo to tabName
-                        if t is currentTab then
-                            set selectedIdx to (i - 1)
-                        end if
-                    end repeat
-                    -- Only process first window
-                    exit repeat
-                end repeat
-                return {tabInfo, selectedIdx}
-            end tell
-            """
-        } else if bundleId == "com.google.Chrome" || appName.contains("Chrome") {
-            script = """
-            tell application "Google Chrome"
-                set tabInfo to {}
-                set selectedIdx to -1
-                repeat with w in windows
-                    set tabCount to count of tabs of w
-                    set activeIdx to active tab index of w
-                    repeat with i from 1 to tabCount
-                        set tabTitle to title of tab i of w
-                        set end of tabInfo to tabTitle
-                    end repeat
-                    set selectedIdx to (activeIdx - 1)
-                    exit repeat
-                end repeat
-                return {tabInfo, selectedIdx}
-            end tell
-            """
+    /// How long a cached browser tab list stays valid before we re-run the script.
+    private static let browserTabCacheTTL: TimeInterval = 2.0
+
+    /// Get browser tabs via AppleScript (Safari, Chrome, Arc have native scripting support)
+    /// Returns (tabTitles, selectedIndex) or nil if not a supported browser.
+    ///
+    /// Non-blocking: returns the most recent cached result (nil until the first fetch
+    /// completes, in which case callers fall back to AX-based tab detection) and kicks
+    /// off a background refresh. Never runs AppleScript on the calling thread, because
+    /// this is called from refresh() on the main thread.
+    func getBrowserTabs(bundleId: String, appName: String) -> (titles: [String], selectedIndex: Int)? {
+        guard let scriptSource = Self.browserTabScript(bundleId: bundleId, appName: appName) else {
+            return nil
         }
 
-        guard let scriptSource = script else { return nil }
+        let key = bundleId.isEmpty ? appName : bundleId
 
+        if claimBrowserTabFetch(key: key, ttl: Self.browserTabCacheTTL) {
+            Self.browserScriptQueue.async { [weak self] in
+                guard let self else { return }
+                let result = Self.runBrowserTabScript(scriptSource)
+                // Only overwrite a good result when the new one succeeded; a transient
+                // script failure shouldn't make tabs disappear from the list.
+                if let result {
+                    self.setCachedBrowserTabs(key: key, value: result)
+                }
+                self.finishBrowserTabFetch(key: key)
+            }
+        }
+
+        return getCachedBrowserTabs(key: key)
+    }
+
+    /// Builds the tab-listing script for supported browsers, or nil for other apps.
+    /// Each script is wrapped in `with timeout` so a busy or wedged browser bounds the
+    /// Apple Event wait instead of blocking for the two-minute AE default.
+    private static func browserTabScript(bundleId: String, appName: String) -> String? {
+        if bundleId == "com.apple.Safari" || appName == "Safari" {
+            return """
+            with timeout of 2 seconds
+                tell application "Safari"
+                    set tabInfo to {}
+                    set selectedIdx to -1
+                    repeat with w in windows
+                        set tabCount to count of tabs of w
+                        set currentTab to current tab of w
+                        repeat with i from 1 to tabCount
+                            set t to tab i of w
+                            set tabName to name of t
+                            set end of tabInfo to tabName
+                            if t is currentTab then
+                                set selectedIdx to (i - 1)
+                            end if
+                        end repeat
+                        -- Only process first window
+                        exit repeat
+                    end repeat
+                    return {tabInfo, selectedIdx}
+                end tell
+            end timeout
+            """
+        } else if bundleId == "com.google.Chrome" || appName.contains("Chrome") {
+            return """
+            with timeout of 2 seconds
+                tell application "Google Chrome"
+                    set tabInfo to {}
+                    set selectedIdx to -1
+                    repeat with w in windows
+                        set tabCount to count of tabs of w
+                        set activeIdx to active tab index of w
+                        repeat with i from 1 to tabCount
+                            set tabTitle to title of tab i of w
+                            set end of tabInfo to tabTitle
+                        end repeat
+                        set selectedIdx to (activeIdx - 1)
+                        exit repeat
+                    end repeat
+                    return {tabInfo, selectedIdx}
+                end tell
+            end timeout
+            """
+        }
+        return nil
+    }
+
+    /// Executes a tab-listing script and parses its {tabTitles, selectedIndex} result.
+    /// Must only be called from `browserScriptQueue`.
+    private static func runBrowserTabScript(_ source: String) -> (titles: [String], selectedIndex: Int)? {
         var error: NSDictionary?
-        guard let appleScript = NSAppleScript(source: scriptSource) else { return nil }
+        guard let appleScript = NSAppleScript(source: source) else { return nil }
 
         let result = appleScript.executeAndReturnError(&error)
-        if error != nil { return nil }
+        if let error {
+            debugLog("getBrowserTabs: AppleScript failed: \(error)")
+            return nil
+        }
 
         // Parse result - it's a list containing {tabTitles, selectedIndex}
         guard result.numberOfItems >= 2 else { return nil }
@@ -207,7 +256,7 @@ extension WindowManager {
         let selectedIdxDesc = result.atIndex(2)
 
         var titles: [String] = []
-        if let tabList = tabListDesc {
+        if let tabList = tabListDesc, tabList.numberOfItems > 0 {
             for i in 1...tabList.numberOfItems {
                 if let item = tabList.atIndex(i), let title = item.stringValue {
                     titles.append(title)

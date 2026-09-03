@@ -218,12 +218,34 @@ localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event
 | tabScreenshotCache | "pid:title" | Background tab screenshots |
 | contentCache | windowID | OCR text results |
 | tabOcrCache | "pid:title" | Background tab OCR |
+| browserTabCache | bundleId | Safari/Chrome tab lists (2s TTL) |
 
 ## Threading Model
 
 - **Main thread**: UI updates, SwiftUI
-- **Background tasks**: Screenshot capture, OCR, window enumeration
+- **Background tasks**: Screenshot capture, OCR, window enumeration, browser tab discovery
 - **Concurrency**: Swift async/await with TaskGroups for parallel capture
+
+`WindowManager.refresh()` runs on the main thread once per second while the sidebar is
+visible, so it must never make a blocking call. Browser tab discovery uses AppleScript,
+and an Apple Event send blocks the calling thread until the target app replies (up to the
+AE default timeout of ~2 minutes). It therefore runs on a dedicated serial queue and
+`refresh()` only reads the resulting cache:
+
+```swift
+// refresh() → getBrowserTabs() returns immediately from cache,
+// scheduling a background refresh when the entry is older than the TTL.
+if claimBrowserTabFetch(key: key, ttl: Self.browserTabCacheTTL) {
+    Self.browserScriptQueue.async { [weak self] in
+        let result = Self.runBrowserTabScript(scriptSource)
+        ...
+    }
+}
+return getCachedBrowserTabs(key: key)
+```
+
+The queue is serial because `NSAppleScript` is not thread safe, and an in-flight set
+prevents duplicate scripts from queueing up for the same browser.
 
 ```swift
 // Parallel thumbnail loading

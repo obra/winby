@@ -2,6 +2,11 @@
 
 All notable changes to Winby will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- UI freeze (spinning beachball) while the sidebar is open, caused by browser tab discovery running synchronous AppleScript on the main thread from the 1-second refresh timer. Tab lookups now run on a background queue behind a short-lived cache, and the scripts carry an explicit `with timeout` so a busy browser can no longer stall the Apple Event send.
+
 ## [1.3.1] - 2026-01-02
 
 ### Fixed
