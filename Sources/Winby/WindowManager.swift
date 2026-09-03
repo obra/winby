@@ -105,6 +105,55 @@ class WindowManager: ObservableObject {
     var isIndexing = false
     var lastIndexed: [UInt32: Date] = [:]
 
+    // MARK: - Browser tab cache
+    //
+    // Browser tab discovery uses AppleScript, and an Apple Event send can block the
+    // calling thread for as long as the AE timeout. refresh() runs on the main thread
+    // once per second while the sidebar is visible, so executing those scripts inline
+    // froze the UI (spinning beachball). Scripts now run on a background serial queue
+    // and refresh() only ever reads these caches.
+
+    /// Last successful browser tab lookup, keyed by bundle id (or app name as fallback).
+    private var _browserTabCache: [String: (titles: [String], selectedIndex: Int)] = [:]
+    /// When each key was last fetched, used to rate-limit AppleScript execution.
+    private var _browserTabFetchedAt: [String: Date] = [:]
+    /// Keys with a script currently executing, so we never pile up duplicate sends.
+    private var _browserTabInFlight: Set<String> = []
+
+    func getCachedBrowserTabs(key: String) -> (titles: [String], selectedIndex: Int)? {
+        cacheLock.withLock { _browserTabCache[key] }
+    }
+
+    func setCachedBrowserTabs(key: String, value: (titles: [String], selectedIndex: Int)?) {
+        cacheLock.withLock {
+            if let value {
+                _browserTabCache[key] = value
+            } else {
+                _browserTabCache.removeValue(forKey: key)
+            }
+        }
+    }
+
+    /// Claims a fetch slot for `key`. Returns false when a fetch is already running or
+    /// the previous result is still within `ttl`.
+    func claimBrowserTabFetch(key: String, ttl: TimeInterval) -> Bool {
+        cacheLock.withLock {
+            if _browserTabInFlight.contains(key) { return false }
+            if let last = _browserTabFetchedAt[key], Date().timeIntervalSince(last) < ttl {
+                return false
+            }
+            _browserTabInFlight.insert(key)
+            return true
+        }
+    }
+
+    func finishBrowserTabFetch(key: String) {
+        cacheLock.withLock {
+            _browserTabInFlight.remove(key)
+            _browserTabFetchedAt[key] = Date()
+        }
+    }
+
     init() {
         cid = SLSMainConnectionID()
         // Don't start refreshing until sidebar is shown - saves CPU when idle
